@@ -1,0 +1,3 @@
+[deps]
+MsgPack = "99f44e22-a591-53d1-9472-aa23ef4bd671"
+ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
