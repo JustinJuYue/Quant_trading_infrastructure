@@ -24,7 +24,7 @@ echo "[INFO] Running Python client..."
 (
   cd "$ROOT_DIR/python_app"
   source .venv/bin/activate
-  python client.py
+  python live_feed_integration.py
 )
 
 echo "[INFO] Python client finished."

@@ -14,7 +14,7 @@ fi
 
 source .venv/bin/activate
 pip install --upgrade pip
-pip install pyzmq msgpack
+pip install pyzmq msgpack ccxt pandas numpy pyarrow
 pip freeze > requirements.txt
 
 echo "[INFO] Python setup done."

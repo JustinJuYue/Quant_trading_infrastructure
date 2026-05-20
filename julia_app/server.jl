@@ -42,8 +42,8 @@ function run_quant_server()
     sock = Socket(ctx, REP)
     
     println("==================================================")
-    println("🚀 Julia Quant Math Engine Started")
-    println("📡 Listening for Python Market Data on $ZMQ_ENDPOINT")
+    println("Julia Quant Math Engine Started")
+    println("Listening for Python Market Data on $ZMQ_ENDPOINT")
     println("==================================================")
     
     try
