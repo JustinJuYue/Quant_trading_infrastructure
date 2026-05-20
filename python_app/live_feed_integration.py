@@ -34,10 +34,10 @@ def serialize_row_to_dict(row, symbol: str) -> dict:
 def run_live_feed():
     load_dotenv()  # 读取 .env
 
-    symbol = "BTC/USDT"
+    symbol = "BTC/USD"
 
     # 1) Public data fetcher
-    fetcher = CryptoDataFetcher(exchange_id="binance")
+    fetcher = CryptoDataFetcher(exchange_id="kraken")
 
     # 2) Authenticated exchange for execution
     api_key = os.getenv("KRAKEN_API_KEY")
