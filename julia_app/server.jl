@@ -1,92 +1,94 @@
-# Import required packages
 using ZMQ
 using MsgPack
 using Dates
 
+# Include the core interface
+include("src/Core.jl")
+using .QuantCore
+
 const ZMQ_ENDPOINT = "tcp://127.0.0.1:5555"
+const ALPHAS_DIR = joinpath(@__DIR__, "src", "alphas")
 
 """
-    process_market_data(data::Dict) -> Dict
+    load_alpha_plugin(filename::String, TypeName::Symbol) -> AbstractAlpha
 
-Simulate the core logic of the strategy engine. Receives a dictionary and returns a trading signal.
-Keep this function pure to facilitate future Just-In-Time (JIT) compilation optimizations.
+Dynamically includes the alpha script and instantiates the strategy struct.
+This decouples the deployment of new strategies from the server codebase.
 """
-function process_market_data(data::Dict)
-    # In a live trading environment, this is where your Kalman Filters, 
-    # matrix operations, or Stochastic Differential Equations (SDEs) will reside.
-    ticker = get(data, "ticker", "UNKNOWN")
-    last_price = get(data, "last_price", 0.0)
+function load_alpha_plugin(filename::String, TypeName::Symbol)::AbstractAlpha
+    filepath = joinpath(ALPHAS_DIR, filename)
+    if !isfile(filepath)
+        error("Alpha plugin not found at: $filepath")
+    end
     
-    # Print the features of the received slice (Replace with async logging in production)
-    println("[$(now())] Received Data -> Ticker: $ticker, Price: $last_price")
+    # Evaluate the file in the current module
+    include(filepath)
     
-    # Construct and return a mocked trading signal
-    signal = Dict(
-        "action" => "BUY",
-        "ticker" => ticker,
-        "weight" => 0.5,
-        "timestamp" => Dates.datetime2unix(now()) * 1000,
-        "engine_status" => "HEALTHY"
-    )
-    return signal
+    # Dynamically instantiate the struct using its symbol
+    alpha_instance = Base.invokelatest(eval(TypeName))
+    println("[INFO] Successfully loaded Alpha Plugin: $(typeof(alpha_instance))")
+    return alpha_instance
 end
 
 """
-    run_quant_server()
+    run_quant_server(active_alpha::AbstractAlpha)
 
-Start the ZMQ REP server, listening for market data from the Python client.
-Includes comprehensive exception handling and resource management.
+The main event loop. Notice how it takes an `AbstractAlpha` as an argument.
+Julia's JIT compiler will specialize this loop for the exact concrete type passed in,
+ensuring zero-overhead dynamic dispatch during live trading.
 """
-function run_quant_server()
+function run_quant_server(active_alpha::AbstractAlpha)
     ctx = Context()
     sock = Socket(ctx, REP)
     
     println("==================================================")
-    println("Julia Quant Math Engine Started")
-    println("Listening for Python Market Data on $ZMQ_ENDPOINT")
+    println("🚀 Julia Quant Engine Host Started")
+    println("🧠 Active Alpha: $(active_alpha.strategy_name)")
+    println("📡 Listening on $ZMQ_ENDPOINT")
     println("==================================================")
     
     try
         ZMQ.bind(sock, ZMQ_ENDPOINT)
         
-        # Main event loop
         while true
-            # Block and wait for binary data from Python
             msg_bytes = ZMQ.recv(sock)
             
             try
-                # 1. Deserialize MessagePack to Julia Dict
                 market_data = MsgPack.unpack(msg_bytes)
                 
-                # 2. Strategy computation
-                signal = process_market_data(market_data)
+                # --- POLYMORPHIC DISPATCH ---
+                # This calls the specific logic defined in Alpha001_VolumeMomentum.jl
+                signal = generate_signal(active_alpha, market_data)
+                # ----------------------------
                 
-                # 3. Serialize and send response
-                reply_bytes = MsgPack.pack(signal)
-                ZMQ.send(sock, reply_bytes)
+                # Optionally print BUY/SELL actions to the console for debugging
+                if signal["action"] != "HOLD"
+                    println("[$(now())] [SIGNAL] $(signal["action"]) $(signal["ticker"]) @ $(signal["price_at_signal"]) (Alpha: $(signal["alpha_id"]))")
+                end
+                
+                ZMQ.send(sock, MsgPack.pack(signal))
                 
             catch e
-                # Catch errors during a single request to prevent the entire engine from crashing
-                println(stderr, "[$(now())] [ERROR] Data processing exception: ", e)
-                
-                # Must return an error response to unblock the Python client
+                println(stderr, "[$(now())] [ERROR] Signal Generation Exception: ", e)
                 error_reply = MsgPack.pack(Dict("action" => "ERROR", "msg" => string(e)))
                 ZMQ.send(sock, error_reply)
             end
         end
     catch e
         if e isa InterruptException
-            println("\n[INFO] Interrupt signal received. Gracefully shutting down Julia engine...")
+            println("\n[INFO] Gracefully shutting down Julia host...")
         else
-            println(stderr, "\n[FATAL ERROR] Engine encountered a fatal error: ", e)
+            println(stderr, "\n[FATAL ERROR] Host crashed: ", e)
         end
     finally
-        # Resource cleanup to prevent zombie processes from holding the port
         close(sock)
         close(ctx)
-        println("[INFO] ZMQ resources released. Process terminated.")
     end
 end
 
-# Run the run_quant_server
-run_quant_server()
+# --- BOOTSTRAP SEQUENCE ---
+# Easily swap strategies here by changing the filename and struct name
+active_strategy = load_alpha_plugin("Alpha001_VolumeMomentum.jl", :Alpha001_VolumeMomentum)
+
+# Launch the server with the injected dependency
+run_quant_server(active_strategy)
