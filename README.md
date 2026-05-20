@@ -32,9 +32,9 @@ Quant_trading_infrastructure/
 
 ## Prerequisites
 
-Python 3.10+
-Julia 1.11.x
-macOS/Linux shell (Windows users can use Git Bash or WSL)
+- Python 3.10+
+- Julia 1.11.x
+- macOS/Linux shell (Windows users can use Git Bash or WSL)
 
 ---
 
@@ -90,6 +90,10 @@ python client.py
 
 ```
 ./scripts/run_local.sh
+```
+### First time
+```
+chmod +x scripts/run_local.sh
 ```
 
 What it does:
