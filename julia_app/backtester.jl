@@ -18,26 +18,14 @@ const ALPHAS_DIR = joinpath(@__DIR__, "src", "alphas")
 # ----------------------------------------------------------------------------
 # STEP 2: Dynamic Plugin Loader with World Age Resolution
 # ----------------------------------------------------------------------------
-"""
-    load_alpha_plugin(filename::String, struct_name::Symbol) -> AbstractAlpha
-
-Dynamically includes the strategy file and safely instantiates it.
-Uses `Base.invokelatest` to bypass Julia's World Age restrictions, 
-ensuring the newly compiled struct can be immediately executed in the same session.
-"""
 function load_alpha_plugin(filename::String, struct_name::Symbol)::AbstractAlpha
     filepath = joinpath(ALPHAS_DIR, filename)
     if !isfile(filepath)
         error("Alpha plugin not found at: $filepath")
     end
     
-    # 1. Load the new type into the current session
     include(filepath)
-    
-    # 2. Evaluate the symbol to get the Type/Constructor
     type_constructor = eval(struct_name)
-    
-    # 3. Use invokelatest to instantiate, solving the world-age problem
     alpha_instance = Base.invokelatest(type_constructor)
     println("[INFO] Successfully loaded and compiled Alpha: $(typeof(alpha_instance))")
     
@@ -47,30 +35,15 @@ end
 # ----------------------------------------------------------------------------
 # STEP 3: Virtual Matching Engine (Event-Driven)
 # ----------------------------------------------------------------------------
-"""
-    run_backtest(alpha::AbstractAlpha, df::DataFrame)
-
-A strict event-driven loop that simulates historical execution row-by-row 
-to completely eliminate Look-ahead Bias.
-"""
-# ----------------------------------------------------------------------------
-# STEP 3: Virtual Matching Engine (Event-Driven)
-# ----------------------------------------------------------------------------
-
-"""
-    run_backtest(alpha::AbstractAlpha, df::DataFrame)
-
-A strict event-driven loop that simulates historical execution row-by-row.
-Enhanced with Institutional-Grade performance metrics.
-"""
 function run_backtest(alpha::AbstractAlpha, df::DataFrame)
-    # --- Exchange Parameters ---
+    # --- Exchange Parameters (升级为合约费率体系) ---
     initial_capital = 100_000.0
     usdt_balance = initial_capital
     position = 0.0          
     
-    fee_rate = 0.001        # 0.1% Taker Fee
-    slippage_rate = 0.0005  # 0.05% Slippage penalty per trade
+    fee_maker = 0.0002       # 0.02% 限价单费率 (Kraken Futures)
+    fee_taker = 0.0005       # 0.05% 市价单费率
+    slippage_taker = 0.00015 # 0.015% 市价单真实滑点
     
     # --- Telemetry & State Tracking ---
     equity_curve = Float64[]
@@ -91,45 +64,76 @@ function run_backtest(alpha::AbstractAlpha, df::DataFrame)
         market_data = Dict{String, Any}(
             "ticker" => "BTC/USDT",
             "close" => row.close,
-            "volume_spike" => row.volume_spike
+            "volume_spike" => get(row, :volume_spike, 0)
         )
         
         signal = generate_signal(alpha, market_data)
-        action = get(signal, "action", "HOLD")
         
-        # --- Execution Logic ---
-        if action == "BUY" && usdt_balance > 1.0 
-            exec_price = row.close * (1.0 + slippage_rate)
-            usable_funds = usdt_balance * (1.0 - fee_rate)
-            qty_bought = usable_funds / exec_price
+        # 1. 提取信号与权重
+        action = get(signal, "action", "HOLD")
+        target_weight = get(signal, "weight", 0.0) 
+        order_type = get(signal, "order_type", "TAKER") 
+        
+        # 2. 动态匹配真实成本
+        actual_fee = order_type == "MAKER" ? fee_maker : fee_taker
+        actual_slippage = order_type == "MAKER" ? 0.0 : slippage_taker
+
+        # 3. 实时 Mark-to-Market 计算当前总权益
+        current_equity = usdt_balance + (position * row.close)
+        
+        # 4. 计算目标仓位暴露度 与 当前真实仓位暴露度
+        target_exposure = current_equity * target_weight
+        current_exposure = position * row.close
+        
+        # --- Execution Logic (目标权重动态调仓) ---
+        if action == "BUY" && target_exposure > current_exposure + 1.0 
+            # 只买入差额部分
+            funds_to_spend = target_exposure - current_exposure
+            funds_to_spend = min(funds_to_spend, usdt_balance) # 绝对防止透支
             
-            entry_cost = usdt_balance 
-            
-            position += qty_bought
-            usdt_balance = 0.0  
-            total_trades += 1
-            
-        elseif action == "SELL" && position > 0.0
-            exec_price = row.close * (1.0 - slippage_rate)
-            gross_funds = position * exec_price
-            net_proceeds = gross_funds * (1.0 - fee_rate)
-            
-            trade_pnl = net_proceeds - entry_cost
-            if trade_pnl > 0
-                gross_profit += trade_pnl
-            else
-                gross_loss += abs(trade_pnl)
+            if funds_to_spend > 10.0 # 最小下单金额10 USDT
+                # 使用动态滑点和手续费计算
+                exec_price = row.close * (1.0 + actual_slippage)
+                usable_funds = funds_to_spend * (1.0 - actual_fee)
+                qty_bought = usable_funds / exec_price
+                
+                entry_cost += funds_to_spend 
+                position += qty_bought
+                usdt_balance -= funds_to_spend  
+                total_trades += 1
             end
             
-            usdt_balance += net_proceeds
-            position = 0.0      
-            entry_cost = 0.0    
-            total_trades += 1
+        elseif action == "SELL" && current_exposure > target_exposure + 1.0
+            # 只卖出多余的部分
+            value_to_sell = current_exposure - target_exposure
+            qty_to_sell = value_to_sell / row.close
+            qty_to_sell = min(qty_to_sell, position) # 防止超卖
+            
+            if qty_to_sell > 0.0001 # 最小卖出数量限制
+                exec_price = row.close * (1.0 - actual_slippage)
+                gross_funds = qty_to_sell * exec_price
+                net_proceeds = gross_funds * (1.0 - actual_fee)
+                
+                # 按比例核算 PnL 成本
+                sold_proportion = qty_to_sell / (position + 1e-8)
+                cost_of_sold = entry_cost * sold_proportion
+                
+                trade_pnl = net_proceeds - cost_of_sold
+                if trade_pnl > 0
+                    gross_profit += trade_pnl
+                else
+                    gross_loss += abs(trade_pnl)
+                end
+                
+                usdt_balance += net_proceeds
+                position -= qty_to_sell      
+                entry_cost -= cost_of_sold    
+                total_trades += 1
+            end
         end
         
-        # Mark-to-Market (MTM) Valuation
-        current_equity = usdt_balance + (position * row.close)
-        push!(equity_curve, current_equity)
+        # 记录每步资金曲线
+        push!(equity_curve, usdt_balance + (position * row.close))
     end
     
     # ------------------------------------------------------------------------
@@ -137,8 +141,8 @@ function run_backtest(alpha::AbstractAlpha, df::DataFrame)
     # ------------------------------------------------------------------------
     if position > 0.0
         final_price = df[end, :close]
-        exec_price = final_price * (1.0 - slippage_rate)
-        net_proceeds = (position * exec_price) * (1.0 - fee_rate)
+        exec_price = final_price * (1.0 - slippage_taker) # 最后清仓强制以 TAKER 计算
+        net_proceeds = (position * exec_price) * (1.0 - fee_taker)
         
         trade_pnl = net_proceeds - entry_cost
         if trade_pnl > 0
@@ -158,8 +162,6 @@ function run_backtest(alpha::AbstractAlpha, df::DataFrame)
     # ------------------------------------------------------------------------
     # STEP 4: Institutional-Grade Performance Evaluation
     # ------------------------------------------------------------------------
-    
-    # 1. Total Return & Max Drawdown
     total_return_pct = ((final_equity - initial_capital) / initial_capital) * 100
     peak = initial_capital
     max_dd_pct = 0.0
@@ -174,15 +176,12 @@ function run_backtest(alpha::AbstractAlpha, df::DataFrame)
     end
     max_dd_decimal = max_dd_pct / 100.0
     
-    # 2. Return Series Extraction
     N = length(equity_curve)
     returns = diff(equity_curve) ./ equity_curve[1:end-1]
     
-    # 3. Annualized Return (Ra)
     days = N / (24 * 60)
     annualized_return = days > 0 ? (final_equity / initial_capital)^(365.0 / days) - 1.0 : 0.0
     
-    # 4. Annualized Sharpe Ratio
     Rf = 0.04
     Rf_min = Rf / 525600.0
     
@@ -194,7 +193,6 @@ function run_backtest(alpha::AbstractAlpha, df::DataFrame)
         sharpe_ratio = ((mu - Rf_min) / sigma) * sqrt(525600.0)
     end
     
-    # 5. Annualized Sortino Ratio
     sortino_ratio = 0.0
     if length(returns) > 0
         downside_sq_sum = sum( r < Rf_min ? (r - Rf_min)^2 : 0.0 for r in returns )
@@ -205,13 +203,11 @@ function run_backtest(alpha::AbstractAlpha, df::DataFrame)
         end
     end
     
-    # 6. Calmar Ratio
     calmar_ratio = 0.0
     if max_dd_decimal > 0.0
         calmar_ratio = annualized_return / max_dd_decimal
     end
     
-    # 7. Profit Factor
     profit_factor = 0.0
     if gross_loss > 0.0
         profit_factor = gross_profit / gross_loss
@@ -219,12 +215,9 @@ function run_backtest(alpha::AbstractAlpha, df::DataFrame)
         profit_factor = Inf 
     end
     
-    # ------------------------------------------------------------------------
-    # Console Report Generation
-    # ------------------------------------------------------------------------
     println("\n==================================================")
-    println("📊 INSTITUTIONAL QUANT BACKTEST REPORT")
-    println("🧠 Alpha Engine : $(alpha.strategy_name)")
+    println("📊 QUANT BACKTEST REPORT")
+    println("Alpha Engine : $(alpha.strategy_name)")
     println("==================================================")
     println("Initial Capital   : \$$(string(initial_capital))")
     println("Final Equity      : \$$(round(final_equity, digits=2))")
@@ -244,57 +237,29 @@ function run_backtest(alpha::AbstractAlpha, df::DataFrame)
     println("==================================================\n")
 end
 
-"""
-    load_historical_parquet(file_path::String) -> DataFrame
-
-Loads the Parquet file generated by the Python sync script.
-Ensures strict temporal ordering and exact type matching to prevent Type Instability 
-during the event-driven matching loop.
-"""
 function load_historical_parquet(file_path::String)::DataFrame
     if !isfile(file_path)
         error("FATAL: Historical data file not found at: $file_path. Did you run history_sync.py?")
     end
     
     println("[INFO] Loading real historical data from: $file_path")
-    
-    # Load Parquet file efficiently
     ds = Parquet2.Dataset(file_path)
     df = DataFrame(ds)
-    
-    # 1. Enforce strict temporal ordering (Chronological ascending)
-    # This guarantees Look-ahead Bias is structurally impossible
     sort!(df, :timestamp)
-    
-    # 2. Type casting safety
-    # Python's PyArrow might infer numeric types differently based on architecture.
-    # We strictly cast them to match our Alpha expectations.
     df.close = convert.(Float64, df.close)
     df.volume_spike = convert.(Int64, df.volume_spike)
-    
-    # Check for NaN values just in case Python missed them
     if any(isnan, df.close)
         error("FATAL: Corrupted data detected. 'close' column contains NaNs.")
     end
-    
     println("[INFO] Data ingestion successful. Total rows (ticks): $(nrow(df))")
     return df
 end
 
-
-# ----------------------------------------------------------------------------
-# BOOTSTRAP SEQUENCE
-# ----------------------------------------------------------------------------
 if abspath(PROGRAM_FILE) == @__FILE__
-    # 1. 精准定位你的真实数据文件
     data_path = joinpath(@__DIR__, "..", "data", "BTC_USDT_1m.parquet")
-    
-    # 🚨 修复Bug：调用 AI 编写的强类型安全加载函数
     df_history = load_historical_parquet(data_path)
     
-    # 2. 动态加载你的策略插件
-    active_strategy = load_alpha_plugin("Alpha001_VolumeMomentum.jl", :Alpha001_VolumeMomentum)
-    
-    # 3. 启动回测引擎
+    # 已经修改为加载 Alpha002
+    active_strategy = load_alpha_plugin("Alpha002_ZScoreReversion.jl", :Alpha002_ZScoreReversion)
     run_backtest(active_strategy, df_history)
 end

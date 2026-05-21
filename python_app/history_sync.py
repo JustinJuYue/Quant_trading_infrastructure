@@ -65,8 +65,12 @@ def _load_existing(file_path: str) -> pd.DataFrame | None:
     df = pd.read_parquet(file_path)
     df = _ensure_utc_datetime_index(df)
 
-    # Keep expected schema if present
     expected = ['open', 'high', 'low', 'close', 'volume']
+    
+    # 🔴 关键修复：只保留基础数据列，剔除掉 volume_spike 等计算列，防止 Concat 时产生 NaN
+    available_cols = [c for c in expected if c in df.columns]
+    df = df[available_cols]
+
     missing = [c for c in expected if c not in df.columns]
     if missing:
         logger.warning(f"Existing file missing columns {missing}; available={df.columns.tolist()}")
