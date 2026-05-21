@@ -4,9 +4,10 @@
 # ============================================================================
 
 using DataFrames
+using Statistics
 using Dates
 using Random
-# using Parquet2 # Uncomment in production to load real historical data
+using Parquet2 # Uncomment in production to load real historical data
 
 # Include the standard interface WITHOUT modifying it
 include("src/Core.jl")
@@ -52,11 +53,21 @@ end
 A strict event-driven loop that simulates historical execution row-by-row 
 to completely eliminate Look-ahead Bias.
 """
+# ----------------------------------------------------------------------------
+# STEP 3: Virtual Matching Engine (Event-Driven)
+# ----------------------------------------------------------------------------
+
+"""
+    run_backtest(alpha::AbstractAlpha, df::DataFrame)
+
+A strict event-driven loop that simulates historical execution row-by-row.
+Enhanced with Institutional-Grade performance metrics.
+"""
 function run_backtest(alpha::AbstractAlpha, df::DataFrame)
     # --- Exchange Parameters ---
     initial_capital = 100_000.0
     usdt_balance = initial_capital
-    position = 0.0          # Number of coins held
+    position = 0.0          
     
     fee_rate = 0.001        # 0.1% Taker Fee
     slippage_rate = 0.0005  # 0.05% Slippage penalty per trade
@@ -66,96 +77,170 @@ function run_backtest(alpha::AbstractAlpha, df::DataFrame)
     sizehint!(equity_curve, nrow(df))
     total_trades = 0
     
+    # PnL Tracking for Profit Factor
+    entry_cost = 0.0
+    gross_profit = 0.0
+    gross_loss = 0.0
+    
     println("[INFO] Starting Event-Driven Backtest for $(alpha.strategy_name)...")
     
     # ------------------------------------------------------------------------
-    # THE CORE LOOP: Iterating strictly row-by-row (No vectorized cheating)
+    # THE CORE LOOP: Iterating strictly row-by-row
     # ------------------------------------------------------------------------
     for row in eachrow(df)
-        # 1. Construct the current market slice (matching the live ZMQ payload)
         market_data = Dict{String, Any}(
             "ticker" => "BTC/USDT",
             "close" => row.close,
             "volume_spike" => row.volume_spike
         )
         
-        # 2. Query the isolated Alpha logic
         signal = generate_signal(alpha, market_data)
         action = get(signal, "action", "HOLD")
         
-        # 3. Execution Logic with slippage and fees
-        # Note: We enforce a minimum USDT balance check to avoid micro-trades (dust)
+        # --- Execution Logic ---
         if action == "BUY" && usdt_balance > 1.0 
-            # Execute at a WORSE price due to slippage
             exec_price = row.close * (1.0 + slippage_rate)
-            
-            # Calculate how many coins we can buy after fees
             usable_funds = usdt_balance * (1.0 - fee_rate)
             qty_bought = usable_funds / exec_price
             
+            entry_cost = usdt_balance 
+            
             position += qty_bought
-            usdt_balance = 0.0  # Full allocation
+            usdt_balance = 0.0  
             total_trades += 1
             
         elseif action == "SELL" && position > 0.0
-            # Execute at a WORSE price due to slippage
             exec_price = row.close * (1.0 - slippage_rate)
-            
-            # Calculate funds received after fees
             gross_funds = position * exec_price
-            usdt_balance += gross_funds * (1.0 - fee_rate)
+            net_proceeds = gross_funds * (1.0 - fee_rate)
             
-            position = 0.0      # Full liquidation
+            trade_pnl = net_proceeds - entry_cost
+            if trade_pnl > 0
+                gross_profit += trade_pnl
+            else
+                gross_loss += abs(trade_pnl)
+            end
+            
+            usdt_balance += net_proceeds
+            position = 0.0      
+            entry_cost = 0.0    
             total_trades += 1
         end
         
-        # 4. Mark-to-Market (MTM) Valuation for equity curve
+        # Mark-to-Market (MTM) Valuation
         current_equity = usdt_balance + (position * row.close)
         push!(equity_curve, current_equity)
     end
     
     # ------------------------------------------------------------------------
-    # STEP 4: End-of-Run Liquidation & Performance Calculation
+    # End-of-Run Liquidation
     # ------------------------------------------------------------------------
     if position > 0.0
         final_price = df[end, :close]
         exec_price = final_price * (1.0 - slippage_rate)
-        usdt_balance += (position * exec_price) * (1.0 - fee_rate)
+        net_proceeds = (position * exec_price) * (1.0 - fee_rate)
+        
+        trade_pnl = net_proceeds - entry_cost
+        if trade_pnl > 0
+            gross_profit += trade_pnl
+        else
+            gross_loss += abs(trade_pnl)
+        end
+        
+        usdt_balance += net_proceeds
         position = 0.0
         total_trades += 1
-        # Update the last point in the equity curve
         equity_curve[end] = usdt_balance 
     end
     
     final_equity = usdt_balance
     
-    # Calculate Total Return
-    total_return_pct = ((final_equity - initial_capital) / initial_capital) * 100
+    # ------------------------------------------------------------------------
+    # STEP 4: Institutional-Grade Performance Evaluation
+    # ------------------------------------------------------------------------
     
-    # Calculate Max Drawdown (Peak-to-Trough)
+    # 1. Total Return & Max Drawdown
+    total_return_pct = ((final_equity - initial_capital) / initial_capital) * 100
     peak = initial_capital
-    max_dd = 0.0
+    max_dd_pct = 0.0
     for eq in equity_curve
         if eq > peak
             peak = eq
         end
         dd_pct = ((peak - eq) / peak) * 100
-        if dd_pct > max_dd
-            max_dd = dd_pct
+        if dd_pct > max_dd_pct
+            max_dd_pct = dd_pct
+        end
+    end
+    max_dd_decimal = max_dd_pct / 100.0
+    
+    # 2. Return Series Extraction
+    N = length(equity_curve)
+    returns = diff(equity_curve) ./ equity_curve[1:end-1]
+    
+    # 3. Annualized Return (Ra)
+    days = N / (24 * 60)
+    annualized_return = days > 0 ? (final_equity / initial_capital)^(365.0 / days) - 1.0 : 0.0
+    
+    # 4. Annualized Sharpe Ratio
+    Rf = 0.04
+    Rf_min = Rf / 525600.0
+    
+    mu = length(returns) > 0 ? mean(returns) : 0.0
+    sigma = length(returns) > 1 ? std(returns) : 0.0
+    
+    sharpe_ratio = 0.0
+    if sigma > 0.0
+        sharpe_ratio = ((mu - Rf_min) / sigma) * sqrt(525600.0)
+    end
+    
+    # 5. Annualized Sortino Ratio
+    sortino_ratio = 0.0
+    if length(returns) > 0
+        downside_sq_sum = sum( r < Rf_min ? (r - Rf_min)^2 : 0.0 for r in returns )
+        sigma_d = sqrt(downside_sq_sum / length(returns))
+        
+        if sigma_d > 0.0
+            sortino_ratio = ((mu - Rf_min) / sigma_d) * sqrt(525600.0)
         end
     end
     
-    # Print Institutional-Grade Report
+    # 6. Calmar Ratio
+    calmar_ratio = 0.0
+    if max_dd_decimal > 0.0
+        calmar_ratio = annualized_return / max_dd_decimal
+    end
+    
+    # 7. Profit Factor
+    profit_factor = 0.0
+    if gross_loss > 0.0
+        profit_factor = gross_profit / gross_loss
+    elseif gross_profit > 0.0
+        profit_factor = Inf 
+    end
+    
+    # ------------------------------------------------------------------------
+    # Console Report Generation
+    # ------------------------------------------------------------------------
     println("\n==================================================")
-    println("📊 QUANT DEV BACKTEST REPORT")
+    println("📊 INSTITUTIONAL QUANT BACKTEST REPORT")
     println("🧠 Alpha Engine : $(alpha.strategy_name)")
     println("==================================================")
-    println("Initial Capital  : \$$(string(initial_capital))")
-    println("Final Equity     : \$$(round(final_equity, digits=2))")
+    println("Initial Capital   : \$$(string(initial_capital))")
+    println("Final Equity      : \$$(round(final_equity, digits=2))")
+    println("Duration (Days)   : $(round(days, digits=2))")
+    println("Total Trades      : $(total_trades)")
     println("--------------------------------------------------")
-    println("Total Return     : $(round(total_return_pct, digits=2)) %")
-    println("Max Drawdown     : $(round(max_dd, digits=2)) %")
-    println("Total Trades     : $(total_trades)")
+    println("Total Return      : $(round(total_return_pct, digits=2)) %")
+    println("Annualized Return : $(round(annualized_return * 100, digits=2)) %")
+    println("Max Drawdown      : $(round(max_dd_pct, digits=2)) %")
+    println("--------------------------------------------------")
+    println("Sharpe Ratio (Ann): $(round(sharpe_ratio, digits=3))")
+    println("Sortino Ratio(Ann): $(round(sortino_ratio, digits=3))")
+    println("Calmar Ratio      : $(round(calmar_ratio, digits=3))")
+    
+    pf_str = profit_factor == Inf ? "Inf (No Losses)" : string(round(profit_factor, digits=3))
+    println("Profit Factor     : $pf_str")
     println("==================================================\n")
 end
 
@@ -201,17 +286,19 @@ end
 # BOOTSTRAP SEQUENCE
 # ----------------------------------------------------------------------------
 if abspath(PROGRAM_FILE) == @__FILE__
+    # 1. 精准定位你的真实数据文件 (利用相对路径找到上一级的 data 文件夹)
+    data_path = joinpath(@__DIR__, "..", "data", "BTC_USDT_1m.parquet")
+    println("[INFO] Loading real historical data from: $data_path")
     
-    # Define relative path to the shared data directory
-    # Assuming julia is run from my_quant_infra/julia_app/
-    data_file = joinpath(@__DIR__, "..", "data", "BTC_USDT_1m.parquet")
+    # 读取 Parquet 并转换为 DataFrame
+    df_history = DataFrame(Parquet2.Dataset(data_path))
     
-    # 1. Load real Parquet data
-    df_history = load_historical_parquet(data_file)
+    # 🚨 极度重要的质检：强制按时间戳升序排序，坚决杜绝“未来函数”错乱！
+    sort!(df_history, :timestamp)
     
-    # 2. Dynamically load the Strategy Plugin
+    # 2. 动态加载你的策略插件
     active_strategy = load_alpha_plugin("Alpha001_VolumeMomentum.jl", :Alpha001_VolumeMomentum)
     
-    # 3. Fire up the matching engine
+    # 3. 启动回测引擎
     run_backtest(active_strategy, df_history)
 end

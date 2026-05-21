@@ -1,3 +1,4 @@
 [deps]
 MsgPack = "99f44e22-a591-53d1-9472-aa23ef4bd671"
+Parquet2 = "98572fba-bba0-415d-956f-fa77e587d26d"
 ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
