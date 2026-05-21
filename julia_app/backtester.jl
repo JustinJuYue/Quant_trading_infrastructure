@@ -286,15 +286,11 @@ end
 # BOOTSTRAP SEQUENCE
 # ----------------------------------------------------------------------------
 if abspath(PROGRAM_FILE) == @__FILE__
-    # 1. 精准定位你的真实数据文件 (利用相对路径找到上一级的 data 文件夹)
+    # 1. 精准定位你的真实数据文件
     data_path = joinpath(@__DIR__, "..", "data", "BTC_USDT_1m.parquet")
-    println("[INFO] Loading real historical data from: $data_path")
     
-    # 读取 Parquet 并转换为 DataFrame
-    df_history = DataFrame(Parquet2.Dataset(data_path))
-    
-    # 🚨 极度重要的质检：强制按时间戳升序排序，坚决杜绝“未来函数”错乱！
-    sort!(df_history, :timestamp)
+    # 🚨 修复Bug：调用 AI 编写的强类型安全加载函数
+    df_history = load_historical_parquet(data_path)
     
     # 2. 动态加载你的策略插件
     active_strategy = load_alpha_plugin("Alpha001_VolumeMomentum.jl", :Alpha001_VolumeMomentum)
