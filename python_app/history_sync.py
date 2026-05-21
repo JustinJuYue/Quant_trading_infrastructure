@@ -254,4 +254,21 @@ def sync_historical_data(symbol: str = "BTC/USDT", timeframe: str = "1m"):
 
 
 if __name__ == "__main__":
-    sync_historical_data("BTC/USDT", "1m")
+    # 定义需要下载的任务列表 (交易对, 时间级别)
+    sync_tasks = [
+        ("BTC/USDT", "1h"),  # BTC 1小时线 (用于宏观状态与低频统计建模)
+        ("ETH/USDT", "1h"),  # ETH 1小时线 (用于和 BTC 进行低频协整性分析)
+        ("ETH/USDT", "1m")   # ETH 1分钟线 (用于配对高频微观结构测试)
+    ]
+
+    for symbol, timeframe in sync_tasks:
+        logger.info(f"\n" + "="*50)
+        logger.info(f"🚀 STARTING TASK: Syncing {symbol} at {timeframe}")
+        logger.info("="*50)
+        
+        try:
+            sync_historical_data(symbol, timeframe)
+        except Exception as e:
+            logger.error(f"❌ Task {symbol} {timeframe} failed: {e}")
+            
+    logger.info("\n🎉🎉 All requested data sets have been successfully synced! 🎉🎉")

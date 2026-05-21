@@ -1,36 +1,55 @@
 using Dates
-using ..QuantCore  # Import the standard interface
+using ..QuantCore  
 
 """
     Alpha003_PriceKinematics
 
-A professional template for institutional quantitative strategies.
+升级版：完美兼容多资产数据总线架构，包含降噪与交易成本防火墙。
 """
 mutable struct Alpha003_PriceKinematics <: AbstractAlpha
     strategy_name::String
+    
+    # 🚨 新架构必填参数：策略的“数据握手清单”
+    required_tickers::Vector{String}
+    required_timeframe::String
+    
     target_weight::Float64
     k_window::Int
     price_history::Vector{Float64}
     velocity_history::Vector{Float64}
     
     # Constructor
-    function Alpha003_PriceKinematics(name::String="Alpha003_Kinematics", weight::Float64=1.0, k::Int=15)
-        new(name, weight, k, Float64[], Float64[])
+    function Alpha003_PriceKinematics(
+        name::String="Alpha003_Kinematics", 
+        weight::Float64=1.0, 
+        k::Int=15)
+        
+        # 声明策略主权：我只要 BTC 的 1 小时级别数据
+        tickers = ["BTC_USDT"]
+        timeframe = "1h"
+        
+        new(name, tickers, timeframe, weight, k, Float64[], Float64[])
     end
 end
 
 
 """
-    generate_signal(alpha::Alpha003_PriceKinematics, data::Dict) -> Dict
-
-The core execution block. Called exactly once per tick/candle.
+    generate_signal
 """
 function QuantCore.generate_signal(alpha::Alpha003_PriceKinematics, data::Dict)::Dict
 
-    ticker = get(data, "ticker", "UNKNOWN")
-    current_price = get(data, "close", 0.0)
+    # 1. 防御性读取：从多资产总线中精准提取自己需要的数据
+    target_token = alpha.required_tickers[1] 
+    assets_branch = get(data, "assets", Dict())
     
-    # Update memory buffer (k_window + 3 来提供平滑均线计算空间)
+    if haskey(assets_branch, target_token)
+        current_price = assets_branch[target_token]["close"]
+    else
+        # 兼容性兜底，万一在没有资产树的旧环境运行
+        current_price = get(data, "close", 0.0)
+    end
+    
+    # 2. 状态与内存更新 (多预留 3 根 K 线用于后期平滑降噪)
     required_len = alpha.k_window + 3
     push!(alpha.price_history, current_price)
     if length(alpha.price_history) > required_len
@@ -39,9 +58,10 @@ function QuantCore.generate_signal(alpha::Alpha003_PriceKinematics, data::Dict):
     
     action = "HOLD"
     final_weight = 0.0
+    order_type = "TAKER" # 动量突破策略只能市价追进
     
     if length(alpha.price_history) == required_len
-        # 1. 引入平滑：计算均价而不是只用单点价格，过滤1分钟级别的极短期噪音
+        # 3. 降噪过滤：计算均价以过滤单根 K 线的尖刺噪音
         smoothed_current = sum(alpha.price_history[end-2:end]) / 3.0
         smoothed_past = sum(alpha.price_history[1:3]) / 3.0
         
@@ -55,35 +75,35 @@ function QuantCore.generate_signal(alpha::Alpha003_PriceKinematics, data::Dict):
         if length(alpha.velocity_history) == alpha.k_window + 1
             a_t = v_t - alpha.velocity_history[1]
 
-            norm_factor = current_price * 0.001
-            
-            # 2. 引入交易阈值：预期波动大于手续费磨损(例如 0.3%)时才交易
-            cost_threshold = current_price * 0.003 
+            # 4. 交易成本防火墙
+            # 必须保证加速度带来的预期物理空间，大于完整的 Taker 手续费 + 滑点的双边成本
+            min_required_move = current_price * 2 * (0.0005 + 0.00015)
 
-            if v_t > cost_threshold && a_t > cost_threshold
+            if v_t > min_required_move && a_t > min_required_move
                 action = "BUY"
-                signal_strength = a_t / norm_factor
-                # 动态计算仓位：最小买入10%，最大买入50%
-                calculated_weight = clamp(signal_strength, 0.1, 0.5) 
+                # 规范化信号强度
+                signal_strength = a_t / (current_price * 0.01) 
+                calculated_weight = clamp(signal_strength, 0.1, 1.0)
                 final_weight = calculated_weight * alpha.target_weight
                 
-            elseif v_t < -cost_threshold || (v_t > 0.0 && a_t < -cost_threshold)
+            elseif v_t < -min_required_move && a_t < -min_required_move
                 action = "SELL"
-                final_weight = 0.0 # 卖出时目标权重设为0，通知回测器清仓
+                final_weight = 0.0 # 动力枯竭，通知回测器清仓
             end
         end
     end
     
     # ------------------------------------------------------------------------
     # STEP 3: Standardized Signal Dispatch
-    # DO NOT MODIFY THIS BLOCK. The OMS and Backtester depend on this strict schema.
     # ------------------------------------------------------------------------
     return Dict(
         "alpha_id" => alpha.strategy_name,
-        "ticker" => ticker,
+        "ticker" => "MULTIPLE",
         "action" => action,
-        "weight" => final_weight,  # 这里将目标仓位发送出去
+        "weight" => final_weight,
+        "order_type" => order_type,
+        "trade_asset" => target_token,  # <--- 明确打上路由标签，告诉回测器对谁下单
         "price_at_signal" => current_price,
-        "timestamp" => Dates.datetime2unix(now()) * 1000
+        "timestamp" => get(data, "timestamp", Dates.datetime2unix(now()) * 1000)
     )
 end
