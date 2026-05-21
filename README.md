@@ -1,155 +1,255 @@
-# Quant Trading Infrastructure (Python + Julia + ZMQ)
+# Quant Trading Infrastructure: Dual-Engine Alpha & Execution System
 
-A minimal dual-engine trading infrastructure:
+![Julia](https://img.shields.io/badge/Julia-1.9+-9558B2?style=for-the-badge&logo=julia&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
+![Status](https://img.shields.io/badge/Status-Active-brightgreen?style=for-the-badge)
 
-- **Julia engine** (`julia_app/server.jl`): receives market slices and returns signals
-- **Python client** (`python_app/client.py`): sends market slices and reads signals
-- IPC transport: **ZeroMQ over TCP** (`tcp://127.0.0.1:5555`)
-- Serialization: **MessagePack**
+> An enterprise-grade, high-frequency quantitative trading infrastructure designed for
+> cryptocurrency markets. Built on a strict **Dual-Engine Architecture** that separates
+> mathematical modeling from execution mechanics — enabling seamless transitions from
+> offline backtesting to live trading.
+
+---
+
+## Table of Contents
+
+- [Project Structure](#project-structure)
+- [System Architecture](#system-architecture)
+- [Quick Start](#quick-start)
+- [Backtesting and Adjusting Alphas](#backtesting-and-adjusting-alphas)
+- [Creating a Custom Alpha](#creating-a-custom-alpha)
+- [Live Trading](#live-trading)
+- [Tech Stack](#tech-stack)
+- [License](#license)
 
 ---
 
 ## Project Structure
 
-```text
+```plaintext
 Quant_trading_infrastructure/
-├─ julia_app/
-│  ├─ Project.toml
-│  ├─ Manifest.toml
-│  └─ server.jl
-├─ python_app/
-│  ├─ client.py
-│  ├─ requirements.txt
-│  └─ .venv/          # local only (gitignored)
-├─ scripts/
-│  ├─ bootstrap.sh
-│  └─ run_local.sh
-├─ Makefile
-└─ README.md
+├── julia_app/                  # Core Strategy Engine (Numerical Analysis)
+│   ├── src/
+│   │   ├── alphas/             # Alpha logic implementations
+│   │   │   ├── Alpha_Template.jl
+│   │   │   ├── Alpha001_VolumeMomentum.jl
+│   │   │   ├── Alpha002_MeanReversion.jl
+│   │   │   └── Alpha003_PriceKinematics.jl
+│   │   └── Core.jl             # Risk management & shared types
+│   └── backtester.jl           # Institutional backtesting suite
+├── python_app/                 # Execution & Data Operations
+│   ├── data_pipeline.py        # Real-time WebSocket data ingestion
+│   ├── history_sync.py         # Historical Parquet dataset downloader
+│   ├── order_manager.py        # Exchange execution gateway
+│   └── client.py               # Live trading interface
+├── data/                       # Historical data storage (.parquet)
+├── scripts/
+│   └── bootstrap.sh            # Environment setup automation
+├── executions.db               # SQLite trade execution log
+└── README.md
 ```
 
 ---
 
-## Prerequisites
+## System Architecture
 
-- Python 3.10+
-- Julia 1.11.x
-- macOS/Linux shell (Windows users can use Git Bash or WSL)
+This infrastructure enforces a strict **separation of concerns** between two engines,
+each selected for its domain-specific strengths.
+
+### The Python Engine — Execution Layer
+
+Responsible for all I/O-bound tasks, network communications, and exchange interactions.
+
+| Module | Responsibility |
+|---|---|
+| `data_pipeline.py` | Ingests real-time WebSocket feeds; normalizes order book and k-line data |
+| `order_manager.py` | Translates target weights into live exchange API orders; manages slippage and rate limits |
+| `history_sync.py` | Downloads high-precision Parquet datasets for offline backtesting |
+| `client.py` | Live trading interface connecting strategy signals to the execution layer |
+
+### The Julia Engine — Strategy Layer
+
+Responsible for all CPU-bound mathematical computations, state memory, and backtesting.
+
+| Module | Responsibility |
+|---|---|
+| `src/alphas/` | Pure mathematical models that consume price series and output confidence signals |
+| `src/Core.jl` | Pluggable risk subsystem that scales raw alpha signals into safe portfolio weights |
+| `backtester.jl` | Simulates the Python execution layer natively — models Maker/Taker fees, slippage, and delta-based position rebalancing |
 
 ---
 
 ## Quick Start
 
-```
-make bootstrap
-make run
-```
+### Step 1: Bootstrap the Environment
 
----
+```bash
+# Navigate to the project root
+cd Quant_trading_infrastructure/
 
-## Manual Setup
-
-### 1. Setup Python Environment
-
-```
-cd python_app
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install pyzmq msgpack
-pip freeze > requirements.txt
+# Run the automated setup script for both Julia and Python environments
+bash scripts/bootstrap.sh
 ```
 
-### 2. Setup Julia Environment
+### Step 2: Synchronize Market Data
 
+```bash
+# Ingest historical candles into high-performance Parquet storage
+python python_app/history_sync.py
 ```
+
+### Step 3: Provision the Julia Environment
+
+```bash
 cd julia_app
-julia --project=. -e "using Pkg; Pkg.instantiate()"
-```
-If dependency resolution mismatch appears:
-```
-julia --project=. -e "using Pkg; Pkg.resolve(); Pkg.instantiate()"
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 
-## Run Manually (Two Terminals)
+### Step 4: Run the Backtester
 
-### Terminal A (Julia server)
-
+```bash
+# From the julia_app/ directory
+julia --project=. backtester.jl
 ```
-cd julia_app
-julia --project=. server.jl
-```
-### Terminal B (Python client)
-
-```cd python_app
-source .venv/bin/activate
-python client.py
-```
-
-## Run with Script (Recommended)
-
-```
-./scripts/run_local.sh
-```
-### First time
-```
-chmod +x scripts/run_local.sh
-```
-
-What it does:
-
-- Starts Julia server in background
-- Waits 1 second for server warm-up
-- Runs Python client
-- On exit (or Ctrl+C), auto-stops Julia server
-
-markdown_content = """# Quant Trading Infrastructure: Dual-Engine Alpha & Execution System
-
-An enterprise-grade, high-frequency quantitative trading infrastructure that pairs a high-performance mathematical modeling brain (**Julia**) with a robust data ingestion, orchestration, and Order Management System (**Python**). 
-
-This platform supports seamless switching between institutional-grade offline event-driven backtesting and ultra-low latency live execution without modifying core Alpha logic.
 
 ---
 
-## Core Architecture
+## Backtesting and Adjusting Alphas
 
-### 1. Event-Driven Backtester (`backtester.jl`)
-The virtual matching engine has been upgraded from a basic asset tracker to a rigorous sandboxed simulator that mimics real-world exchange mechanics:
-* **Contract Fee Structure:** Native implementation of a Tier-1 exchange fee matrix (e.g., Kraken Futures tier rates: Maker fee of 0.02%, Taker fee of 0.05%).
-* **Realistic Slippage Friction:** Integrated a high-frequency market impact and slippage penalty model (0.015% for Taker orders) to ensure backtest equity curves are highly conservative and replicable in live conditions.
-* **End-of-Run Liquidation:** Implements mandatory force-closure of active inventory at final mark-to-market prices under structural Taker constraints for precise net-of-fee performance reporting.
+The backtester is fully modular. Strategy behavior is controlled by plugging in
+different Alpha and Risk configurations at the bottom of `backtester.jl`.
 
-### 2. Portfolio Target Weight Execution Engine
-Eliminated the rudimentary full-capital "All-In / All-Out" execution loop. The core execution handler now operates on **Delta-Based Position Rebalancing**:
-* **Continuous Allocation:** Reads the abstract target asset allocation weights ($Weight \in [0.0, 1.0]$) dispatched by the Alpha plugins.
-* **Delta Capital Adjustment:** Dynamically computes the precise monetary variance between `target_exposure` and `current_exposure`. It only executes trades for the marginal delta requirement, eliminating unnecessary trade churn and saving massive transaction overhead (**Fee Drag** mitigation).
+### Adjusting Alpha Hyperparameters
 
-### 3. Microstructure Noise Filter & Volatility Protection
-To handle 1-minute high-frequency crypto asset series (e.g., `BTC_USDT_1m.parquet`), the signal processing layers have been reinforced:
-* **Activation Thresholds:** Built-in trigger barriers (e.g., $\text{Signal Strength} > 0.5$) that prevent the execution engine from whipsawing on sub-minute market noise.
-* **Dynamic Bound Constraints (`clamp`):** Hardcoded programmatic guardrails that safely compress un-bounded analytical outputs into valid position sizes, safeguarding the cash tier against accidental over-leveraging during extreme tail-risk events.
+```julia
+# Inside backtester.jl — adjusting the lookback window from 15 to 60 minutes
+active_strategy = Alpha003_PriceKinematics("Alpha003_Slow", 1.0, 60)
+run_backtest(active_strategy, df_history)
+```
 
-### 4. Pluggable Risk Management Subsystem
-The strategy risk logic has been completely decoupled from the predictive models through an abstract layer in `src/Core.jl`:
-* **AbstractRiskModel Base:** Establishes a polymorphic blueprint for risk filters using Julia's multiple dispatch.
-* **PassThroughRisk:** A zero-filter plugin used to evaluate raw alpha signal direction and empirical win rates without capital dampening.
-* **ClampRisk:** A dynamic boundary enforcement plugin that handles automated position compression between standardized minimum and maximum exposure thresholds.
+### Swapping the Risk Module
 
----
+```julia
+# Option A: PassThroughRisk — full allocation, ignores signal strength
+my_risk = QuantCore.PassThroughRisk()
 
-## 📊 Performance Metrics Engine
+# Option B: ClampRisk — caps position size between 10% and 80%
+my_risk = QuantCore.ClampRisk(0.1, 0.8)
 
-The evaluation module processes the continuous equity curve into standard risk-adjusted institutional metrics. Due to the 24/7/365 nature of cryptocurrency markets and high-frequency data inputs, metrics are mathematically scaled using the **High-Frequency Cryptocurrency Annualization Factor**:
+# Attach the risk module to the active alpha
+active_strategy = Alpha003_PriceKinematics("Alpha003_Clamped", 1.0, 60, my_risk)
+```
 
-$$\text{Annualization Factor} = \sqrt{365 \times 24 \times 60} = \sqrt{525,600} \approx 725.0$$
+### Running a Named Alpha via CLI
 
-The reporting engine logs the following key statistics upon run completion:
-* **Annualized Sharpe Ratio:** Uses downscaled risk-free rates matching the 1-minute interval dimensions ($\text{Rf}_{\text{min}} = \text{Rf} / 525,600$) to calculate variance accurately.
-* **Annualized Sortino Ratio:** Isolates downside deviation ($\sigma_d$) using the full-sample size denominator, filtering out good upside volatility from the risk penalty.
-* **Calmar Ratio:** Measures the strategy's annualized rate of return against its maximum peak-to-trough draw-down percentage ($\text{Calmar} = R_a / \text{MaxDD}$).
-* **Profit Factor:** Rigorously maps round-trip closed execution loops to evaluate statistical edge:
-$$\text{Profit Factor} = \frac{\sum \text{Gross Profits}}{\sum |\text{Gross Losses}|}$$
+```bash
+julia julia_app/backtester.jl --alpha Alpha001_VolumeMomentum
+```
 
 ---
 
-## 📂 Repository Structure
+## Creating a Custom Alpha
+
+New strategies can be introduced with no modifications to the backtester or the
+live execution engine. Only the mathematical signal logic needs to be written.
+
+### Step 1: Copy the Template
+
+```bash
+cd julia_app/src/alphas/
+cp Alpha_Template.jl MyNewStrategy.jl
+```
+
+### Step 2: Implement the Signal Logic
+
+```julia
+using Dates
+using Statistics
+using ..QuantCore
+
+# 1. Define the strategy parameters and internal memory state
+mutable struct MyCustomAlpha <: AbstractAlpha
+    strategy_name::String
+    target_weight::Float64
+    risk_model::QuantCore.AbstractRiskModel
+    price_history::Vector{Float64}   # Rolling memory buffer
+end
+
+# 2. Implement the generate_signal interface
+function QuantCore.generate_signal(alpha::MyCustomAlpha, data::Dict)::Dict
+    ticker        = get(data, "ticker", "UNKNOWN")
+    current_price = get(data, "close",  0.0)
+
+    push!(alpha.price_history, current_price)
+
+    action       = "HOLD"
+    final_weight = 0.0
+
+    # --- Signal Logic ---
+    if length(alpha.price_history) > 10
+        recent_return = (current_price - alpha.price_history[end-10]) /
+                         alpha.price_history[end-10]
+
+        if recent_return > 0.005          # Momentum breakout threshold: +0.5%
+            action       = "BUY"
+            raw_strength = recent_return * 100
+            final_weight = QuantCore.apply_risk(
+                               alpha.risk_model, raw_strength, alpha.target_weight)
+
+        elseif recent_return < -0.002     # Exit threshold: -0.2%
+            action       = "SELL"
+            final_weight = 0.0
+        end
+    end
+    # --------------------
+
+    # 3. Return the standardized output schema
+    return Dict(
+        "alpha_id"        => alpha.strategy_name,
+        "ticker"          => ticker,
+        "action"          => action,
+        "weight"          => final_weight,
+        "price_at_signal" => current_price,
+        "timestamp"       => Dates.datetime2unix(now()) * 1000
+    )
+end
+```
+
+> **Architectural Note:** The standardized output schema (`action`, `weight`) ensures
+> that any custom Alpha is immediately compatible with both `backtester.jl` for
+> historical simulation and `order_manager.py` for live exchange execution via ZMQ,
+> without requiring changes to either system.
+
+---
+
+## Live Trading
+
+```bash
+# Start the live execution client
+python python_app/client.py
+```
+
+All executed trades are automatically persisted to `executions.db` (SQLite).
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Strategy and Signal Processing | Julia 1.9+, Statistics.jl |
+| Execution and Data Ingestion | Python 3.10+, WebSockets, REST APIs |
+| Data Storage | Apache Parquet, SQLite |
+| Inter-process Messaging | ZeroMQ (ZMQ) |
+| Build Automation | Bash (`bootstrap.sh`) |
+
+---
+
+## License
+
+This project is licensed under the **MIT License**.
+
+---
+
+*Built for performance. Designed for clarity. Architected for production.*
