@@ -10,3 +10,5 @@ __pycache__/
 # Logs
 *.log
 .env
+
+.data/preview.py
