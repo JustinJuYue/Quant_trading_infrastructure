@@ -193,7 +193,19 @@ function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets
     
     N = length(equity_curve)
     returns = diff(equity_curve) ./ equity_curve[1:end-1]
-    days = N / (24 * 60)
+    
+    # 动态适配策略的时间级别，计算真实经历的天数
+    tf = alpha.required_timeframe
+    minutes_per_bar = 1
+    if tf == "1h"
+        minutes_per_bar = 60
+    elseif tf == "4h"
+        minutes_per_bar = 240
+    elseif tf == "1d"
+        minutes_per_bar = 1440
+    end
+    days = (N * minutes_per_bar) / (24 * 60)
+
     annualized_return = days > 0 ? (final_equity / initial_capital)^(365.0 / days) - 1.0 : 0.0
     
     Rf = 0.04
@@ -281,8 +293,8 @@ if abspath(PROGRAM_FILE) == @__FILE__
     
     # 🔌 Configuration Center (配置中心)
     # 想跑什么策略，只要在这里改名字即可。剩下的数据组合系统会自动处理！
-    alpha_file = "Alpha003_PriceKinematics.jl"
-    alpha_name = :Alpha003_PriceKinematics
+    alpha_file = "Alpha005_MacroReflexivity.jl"
+    alpha_name = :Alpha005_MacroReflexivity
     
     # 1. 系统第一时间编译并载入 Alpha 插件
     active_strategy = load_alpha_plugin(alpha_file, alpha_name)

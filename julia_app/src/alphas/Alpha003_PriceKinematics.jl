@@ -26,7 +26,7 @@ mutable struct Alpha003_PriceKinematics <: AbstractAlpha
         
         # 声明策略主权：我只要 BTC 的 1 小时级别数据
         tickers = ["BTC_USDT"]
-        timeframe = "1h"
+        timeframe = "1m"
         
         new(name, tickers, timeframe, weight, k, Float64[], Float64[])
     end
