@@ -293,8 +293,8 @@ if abspath(PROGRAM_FILE) == @__FILE__
     
     # 🔌 Configuration Center (配置中心)
     # 想跑什么策略，只要在这里改名字即可。剩下的数据组合系统会自动处理！
-    alpha_file = "Alpha005_MacroReflexivity.jl"
-    alpha_name = :Alpha005_MacroReflexivity
+    alpha_file = "Alpha005_1_KellyCriterionMacroReflexivity.jl"
+    alpha_name = :Alpha005_1_KellyCriterionMacroReflexivity
     
     # 1. 系统第一时间编译并载入 Alpha 插件
     active_strategy = load_alpha_plugin(alpha_file, alpha_name)

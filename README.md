@@ -20,6 +20,7 @@
 - [Backtesting and Adjusting Alphas](#backtesting-and-adjusting-alphas)
 - [Creating a Custom Alpha](#creating-a-custom-alpha)
 - [Live Trading](#live-trading)
+- [Operations Manual — Global Interface Control (SOP)](#operations-manual--global-interface-control-sop)
 - [Tech Stack](#tech-stack)
 - [License](#license)
 
@@ -29,24 +30,26 @@
 
 ```plaintext
 Quant_trading_infrastructure/
-├── julia_app/                  # Core Strategy Engine (Numerical Analysis)
+├── julia_app/                      # Core Strategy Engine (Numerical Analysis)
 │   ├── src/
-│   │   ├── alphas/             # Alpha logic implementations
+│   │   ├── alphas/                 # Alpha logic implementations
 │   │   │   ├── Alpha_Template.jl
 │   │   │   ├── Alpha001_VolumeMomentum.jl
 │   │   │   ├── Alpha002_MeanReversion.jl
 │   │   │   └── Alpha003_PriceKinematics.jl
-│   │   └── Core.jl             # Risk management & shared types
-│   └── backtester.jl           # Institutional backtesting suite
-├── python_app/                 # Execution & Data Operations
-│   ├── data_pipeline.py        # Real-time WebSocket data ingestion
-│   ├── history_sync.py         # Historical Parquet dataset downloader
-│   ├── order_manager.py        # Exchange execution gateway
-│   └── client.py               # Live trading interface
-├── data/                       # Historical data storage (.parquet)
+│   │   └── Core.jl                 # Risk management & shared types
+│   ├── backtester.jl               # Institutional backtesting suite
+│   └── server.jl                   # Live alpha fleet server
+├── python_app/                     # Execution & Data Operations
+│   ├── data_pipeline.py            # Real-time WebSocket data ingestion
+│   ├── history_sync.py             # Historical Parquet dataset downloader
+│   ├── order_manager.py            # Exchange execution gateway & risk controls
+│   ├── live_feed_integration.py    # Live routing, data gateway & DRY_RUN switch
+│   └── client.py                   # Live trading interface
+├── data/                           # Historical data storage (.parquet)
 ├── scripts/
-│   └── bootstrap.sh            # Environment setup automation
-├── executions.db               # SQLite trade execution log
+│   └── bootstrap.sh                # Environment setup automation
+├── executions.db                   # SQLite trade execution log
 └── README.md
 ```
 
@@ -64,8 +67,9 @@ Responsible for all I/O-bound tasks, network communications, and exchange intera
 | Module | Responsibility |
 |---|---|
 | `data_pipeline.py` | Ingests real-time WebSocket feeds; normalizes order book and k-line data |
-| `order_manager.py` | Translates target weights into live exchange API orders; manages slippage and rate limits |
+| `order_manager.py` | Translates target weights into live exchange API orders; manages slippage, rate limits, Kelly sizing, and fat-finger risk controls |
 | `history_sync.py` | Downloads high-precision Parquet datasets for offline backtesting |
+| `live_feed_integration.py` | Routes live market data to the Julia engine; controls the DRY_RUN simulation switch |
 | `client.py` | Live trading interface connecting strategy signals to the execution layer |
 
 ### The Julia Engine — Strategy Layer
@@ -77,6 +81,7 @@ Responsible for all CPU-bound mathematical computations, state memory, and backt
 | `src/alphas/` | Pure mathematical models that consume price series and output confidence signals |
 | `src/Core.jl` | Pluggable risk subsystem that scales raw alpha signals into safe portfolio weights |
 | `backtester.jl` | Simulates the Python execution layer natively — models Maker/Taker fees, slippage, and delta-based position rebalancing |
+| `server.jl` | Live alpha fleet server; manages state hydration for all registered alphas on startup |
 
 ---
 
@@ -231,6 +236,136 @@ python python_app/client.py
 ```
 
 All executed trades are automatically persisted to `executions.db` (SQLite).
+
+---
+
+## Operations Manual — Global Interface Control (SOP)
+
+This architecture is intentionally decoupled. During routine operations, each concern
+maps to a precise configuration file. The following reference table defines where each
+control surface lives and how to operate it correctly.
+
+---
+
+### Section 1 — Strategy and Backtesting (Julia Layer)
+
+**Control: Entry / Exit Signal Logic**
+
+- **File:** `julia_app/src/alphas/Alpha*.jl`
+- **Scope:** This layer contains only pure mathematical expressions and threshold
+  constants (e.g., fast/slow moving average periods, reflexivity multipliers). Upon
+  completion, each alpha must emit a dictionary containing `action` and `weight`.
+  No execution logic belongs here.
+
+**Control: Running a Historical Backtest**
+
+- **File:** `julia_app/backtester.jl`
+- **Command:**
+  ```bash
+  julia --project=. backtester.jl
+  ```
+- **Note:** Upon completion, record the **Profit Factor** and estimated **Win Rate**
+  from the output report. These values are required inputs for the Kelly sizer
+  in the Python execution layer.
+
+---
+
+### Section 2 — Risk Controls and Capital Management (Python Layer)
+
+**Control: Kelly Criterion — Alpha Statistics Registration**
+
+- **File:** `python_app/order_manager.py`
+- **Location:** `ExchangeExecution.__init__` method
+- **Operation:** Register or update the statistical profile for each alpha. These
+  values feed directly into the Kelly position sizer.
+
+  ```python
+  self.kelly_sizer.register_alpha_stats(
+      "YourAlphaName",
+      win_rate=0.55,        # Win rate recorded from backtest report
+      win_loss_ratio=1.8    # Profit Factor recorded from backtest report
+  )
+  ```
+
+**Control: Fat-Finger Intercept — Maximum Notional Limit**
+
+- **File:** `python_app/order_manager.py`
+- **Location:** `RiskManager` class
+- **Parameters:**
+
+  | Parameter | Description |
+  |---|---|
+  | `max_notional_usd` | Maximum allowable order size in USD per trade. Guards against API anomalies causing oversized positions. |
+  | `cooldown_seconds` | Mandatory pause between consecutive orders. Prevents cascading erroneous order submissions. |
+
+  ```python
+  self.risk_manager.max_notional_usd = 500
+  self.risk_manager.cooldown_seconds = 10
+  ```
+
+---
+
+### Section 3 — Live Data Routing and Feed Gateway (Python / Julia Interface)
+
+**Control: Adding a New Instrument or Timeframe**
+
+- **File:** `python_app/live_feed_integration.py`
+- **Location:** `feed_tasks = [...]` list
+- **Operation:** Append an entry for each instrument and timeframe to be monitored.
+  The feed manager will automatically loop through all entries, tag each payload,
+  and forward it to the Julia engine.
+
+  ```python
+  feed_tasks = [
+      {"symbol": "BTC/USD",  "interval": "1m"},
+      {"symbol": "ETH/USD",  "interval": "1h"},
+      {"symbol": "SOL/USD",  "interval": "1d"},  # <-- append new instruments here
+  ]
+  ```
+
+**Control: Registering a New Alpha on the Live Server**
+
+- **File:** `julia_app/server.jl`
+- **Location:** `alpha_fleet = [...]` array at the bottom of the file
+- **Operation:** Append the new alpha struct to the fleet array. On server startup,
+  the system will automatically perform **state hydration** for every registered alpha,
+  replaying recent market history to restore internal memory buffers to a consistent
+  operational state.
+
+  ```julia
+  alpha_fleet = [
+      Alpha001_VolumeMomentum("Alpha001", 1.0),
+      Alpha003_PriceKinematics("Alpha003", 1.0, 60),
+      MyNewStrategy("MyStrategy", 1.0),   # <-- register new alphas here
+  ]
+  ```
+
+---
+
+### Section 4 — Simulation vs. Live Execution Switch (Critical)
+
+**Control: DRY_RUN Mode**
+
+- **File:** `python_app/live_feed_integration.py`
+- **Location:** Line ~103. Search for `DRY_RUN =`
+
+This is the single most important operational control in the system. It must be
+verified before every session.
+
+| State | Value | Behavior |
+|---|---|---|
+| Simulation Mode | `DRY_RUN = True` | The full pipeline executes — data ingestion, signal computation, and Kelly sizing — but the final order submission is intercepted. No capital is deployed. A confirmation is printed to the console in place of order dispatch. |
+| Live Execution Mode | `DRY_RUN = False` | The system connects to the Kraken API and submits real orders. Capital is at risk. Use only after thorough backtesting and simulation validation. |
+
+```python
+# python_app/live_feed_integration.py (~line 103)
+
+DRY_RUN = True   # Set to False only when ready for live capital deployment
+```
+
+> **Operational Protocol:** Always begin a new alpha's live deployment in
+> `DRY_RUN = True` mode. Validate signal output and Kelly-sized weights in the
+> console logs for a minimum observation period before switching to live execution.
 
 ---
 
