@@ -11,4 +11,4 @@ __pycache__/
 *.log
 .env
 
-.data/preview.py
+data/preview.py
