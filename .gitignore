@@ -12,3 +12,27 @@ __pycache__/
 .env
 
 data/preview.py
+
+# 🗄️  Data files — stored locally, not in Git
+# ============================================
+data/*.parquet
+data/*.csv
+data/*.feather
+data/*.h5
+data/*.hdf5
+
+# 保留 preview.py 等脚本文件
+!data/*.py
+!data/*.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# VSCode
+.vscode/settings.json
