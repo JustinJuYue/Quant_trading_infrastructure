@@ -30,7 +30,7 @@ mutable struct Alpha005_1_KellyCriterionMacroReflexivity <: AbstractAlpha
         slow::Int=168,  # 1周的长期宏观记忆
         threshold::Float64=0.0002) # 反身性乘数阈值
         
-        tickers = ["ETH_USDT"]
+        tickers = ["BTC_USDT"]
         timeframe = "1h"
         
         new(name, tickers, timeframe, weight, fast, slow, threshold, Float64[], Float64[])
