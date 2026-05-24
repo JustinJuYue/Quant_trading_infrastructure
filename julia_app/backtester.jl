@@ -1,7 +1,9 @@
 # ============================================================================
 # Offline Event-Driven Multi-Asset Backtester
 # Architecture: Strategy-Driven Data Loading (Handshake Protocol) |
-#               Nested Asset Routing | Exchange-Grade Fee Modelling
+#               Nested Asset Routing |
+#               Exchange-Grade Fee Modelling |
+#               Automated Scientific Dashboard Reporting
 # ============================================================================
 
 using DataFrames
@@ -9,6 +11,7 @@ using Statistics
 using Dates
 using Random
 using Parquet2
+using Plots # 用于生成专业图表
 
 # Include the standard interface without modification.
 include("src/Core.jl")
@@ -22,9 +25,6 @@ const ALPHAS_DIR = joinpath(@__DIR__, "src", "alphas")
 
 """
     load_alpha_plugin(filename, struct_name) -> AbstractAlpha
-
-Dynamically load, compile, and instantiate an alpha plugin from the alphas
-directory. Raises an error if the specified file does not exist.
 """
 function load_alpha_plugin(filename::String, struct_name::Symbol)::AbstractAlpha
     filepath = joinpath(ALPHAS_DIR, filename)
@@ -44,32 +44,19 @@ end
 # STEP 2: Virtual Matching Engine (Multi-Asset Nested Routing)
 # ----------------------------------------------------------------------------
 
-"""
-    run_backtest(alpha, aligned_df, target_assets)
-
-Execute an event-driven backtest over the provided aligned dataset.
-
-Iterates row-by-row, constructing a nested asset payload for each bar,
-routing it through the alpha's signal generator, and executing the
-resulting order against a simulated exchange with realistic fee and
-slippage modelling. Produces a full institutional-grade performance report
-upon completion.
-"""
 function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets::Vector{String})
 
-    # --- Exchange Parameters (Kraken Futures perpetual contract fee schedule) ---
+    # --- Exchange Parameters ---
     initial_capital = 100_000.0
     usdt_balance    = initial_capital
 
-    # Per-asset position and cost basis ledgers.
     positions   = Dict{String, Float64}(asset => 0.0 for asset in target_assets)
     entry_costs = Dict{String, Float64}(asset => 0.0 for asset in target_assets)
 
-    fee_maker        = 0.0002   # 0.02% limit order (maker) fee rate
-    fee_taker        = 0.0005   # 0.05% market order (taker) fee rate
-    slippage_taker   = 0.00015  # 0.015% estimated market order slippage
+    fee_maker        = 0.0002   
+    fee_taker        = 0.0005   
+    slippage_taker   = 0.00015  
 
-    # --- Telemetry and State Tracking ---
     equity_curve = Float64[]
     sizehint!(equity_curve, nrow(aligned_df))
     total_trades = 0
@@ -78,13 +65,7 @@ function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets
 
     println("[INFO] Starting multi-asset data bus event loop...")
 
-    # --------------------------------------------------------------------------
-    # Core Event Loop: Strict row-by-row iteration (no look-ahead)
-    # --------------------------------------------------------------------------
     for row in eachrow(aligned_df)
-
-        # 1. Construct the nested asset routing payload for this bar.
-        #    Each asset slice carries its own close price and volume spike flag.
         assets_payload = Dict{String, Dict{String, Any}}()
         for asset in target_assets
             assets_payload[asset] = Dict{String, Any}(
@@ -99,7 +80,6 @@ function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets
             "assets"    => assets_payload
         )
 
-        # 2. Feed the market slice into the alpha and retrieve the standardised signal.
         signal = generate_signal(alpha, market_data)
 
         action        = get(signal, "action",       "HOLD")
@@ -107,29 +87,26 @@ function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets
         order_type    = get(signal, "order_type",   "TAKER")
         trade_asset   = get(signal, "trade_asset",   target_assets[1])
 
-        actual_fee      = order_type == "MAKER" ? fee_maker      : fee_taker
-        actual_slippage = order_type == "MAKER" ? 0.0            : slippage_taker
+        actual_fee      = order_type == "MAKER" ? fee_maker : fee_taker
+        actual_slippage = order_type == "MAKER" ? 0.0       : slippage_taker
 
-        # 3. Mark-to-market: compute total portfolio equity across all assets.
         asset_value = 0.0
         for asset in target_assets
             asset_value += positions[asset] * row[Symbol("close_", asset)]
         end
         current_equity = usdt_balance + asset_value
 
-        # 4. Compare target exposure against current exposure for the trade asset.
         target_exposure  = current_equity * target_weight
         current_exposure = positions[trade_asset] * row[Symbol("close_", trade_asset)]
 
-        # --- Order Execution Logic ---
         if action == "BUY" && target_exposure > current_exposure + 1.0
             funds_to_spend = target_exposure - current_exposure
             funds_to_spend = min(funds_to_spend, usdt_balance)
 
             if funds_to_spend > 10.0
-                exec_price    = row[Symbol("close_", trade_asset)] * (1.0 + actual_slippage)
-                usable_funds  = funds_to_spend * (1.0 - actual_fee)
-                qty_bought    = usable_funds / exec_price
+                exec_price = row[Symbol("close_", trade_asset)] * (1.0 + actual_slippage)
+                usable_funds = funds_to_spend * (1.0 - actual_fee)
+                qty_bought = usable_funds / exec_price
 
                 entry_costs[trade_asset]  += funds_to_spend
                 positions[trade_asset]    += qty_bought
@@ -147,7 +124,6 @@ function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets
                 gross_funds = qty_to_sell * exec_price
                 net_proceeds = gross_funds * (1.0 - actual_fee)
 
-                # Attribute cost basis proportionally to the quantity being sold.
                 sold_proportion  = qty_to_sell / (positions[trade_asset] + 1e-8)
                 cost_of_sold     = entry_costs[trade_asset] * sold_proportion
 
@@ -165,7 +141,6 @@ function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets
             end
         end
 
-        # Record the total portfolio equity for this bar.
         latest_asset_value = 0.0
         for asset in target_assets
             latest_asset_value += positions[asset] * row[Symbol("close_", asset)]
@@ -173,9 +148,7 @@ function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets
         push!(equity_curve, usdt_balance + latest_asset_value)
     end
 
-    # --------------------------------------------------------------------------
-    # End-of-Run Liquidation: Force-close all remaining positions at final price.
-    # --------------------------------------------------------------------------
+    # --- End-of-Run Liquidation ---
     for asset in target_assets
         if positions[asset] > 0.0
             final_price  = aligned_df[end, Symbol("close_", asset)]
@@ -190,7 +163,7 @@ function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets
             end
 
             usdt_balance      += net_proceeds
-            positions[asset]   = 0.0
+            positions[asset]  = 0.0
             total_trades      += 1
         end
     end
@@ -201,9 +174,14 @@ function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets
     # --------------------------------------------------------------------------
     # STEP 3: Institutional-Grade Performance Evaluation
     # --------------------------------------------------------------------------
+    
+    start_time = aligned_df.timestamp[1]
+    end_time   = aligned_df.timestamp[end]
+    start_str  = Dates.format(start_time, "yyyy-mm-dd HH:MM")
+    end_str    = Dates.format(end_time, "yyyy-mm-dd HH:MM")
+
     total_return_pct = ((final_equity - initial_capital) / initial_capital) * 100
 
-    # Maximum drawdown calculation over the full equity curve.
     peak       = initial_capital
     max_dd_pct = 0.0
     for eq in equity_curve
@@ -220,7 +198,6 @@ function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets
     N       = length(equity_curve)
     returns = diff(equity_curve) ./ equity_curve[1:end-1]
 
-    # Derive the number of calendar days elapsed based on the strategy timeframe.
     tf = alpha.required_timeframe
     minutes_per_bar = 1
     if tf == "1h"
@@ -234,16 +211,13 @@ function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets
 
     annualized_return = days > 0 ? (final_equity / initial_capital)^(365.0 / days) - 1.0 : 0.0
 
-    # Risk-free rate annualised at 4%, scaled to per-minute frequency.
     Rf     = 0.04
     Rf_min = Rf / 525_600.0
     mu     = length(returns) > 0 ? mean(returns)  : 0.0
     sigma  = length(returns) > 1 ? std(returns)   : 0.0
 
-    # Annualised Sharpe ratio scaled to per-minute bar frequency.
     sharpe_ratio = sigma > 0.0 ? ((mu - Rf_min) / sigma) * sqrt(525_600.0) : 0.0
 
-    # Annualised Sortino ratio using downside deviation only.
     sortino_ratio = 0.0
     if length(returns) > 0
         downside_sq_sum = sum(r < Rf_min ? (r - Rf_min)^2 : 0.0 for r in returns)
@@ -252,22 +226,33 @@ function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets
     end
 
     calmar_ratio  = max_dd_decimal > 0.0 ? annualized_return / max_dd_decimal : 0.0
-    profit_factor = gross_loss > 0.0 ? gross_profit / gross_loss :
-                    (gross_profit > 0.0 ? Inf : 0.0)
+    profit_factor = gross_loss > 0.0 ? gross_profit / gross_loss : (gross_profit > 0.0 ? Inf : 0.0)
+
+    # --- Buy & Hold (Benchmark) Calculation ---
+    benchmark_asset = target_assets[1]
+    initial_price_primary = aligned_df[1, Symbol("close_", benchmark_asset)]
+    
+    bnh_equity_curve = initial_capital .* (aligned_df[!, Symbol("close_", benchmark_asset)] ./ initial_price_primary)
+    
+    bnh_return_pct = ((bnh_equity_curve[end] - initial_capital) / initial_capital) * 100
+    outperformance = total_return_pct - bnh_return_pct
 
     println("\n==================================================")
     println("  QUANT MULTI-ASSET BACKTEST REPORT")
     println("  Alpha Engine : $(alpha.strategy_name)")
     println("  Assets       : $(join(target_assets, " | "))")
     println("  Resolution   : $(alpha.required_timeframe)")
+    println("  Start Date   : $start_str")
+    println("  End Date     : $end_str")
     println("==================================================")
     println("  Initial Capital   : \$$(string(initial_capital))")
     println("  Final Equity      : \$$(round(final_equity, digits=2))")
     println("  Duration (Days)   : $(round(days, digits=2))")
     println("  Total Trades      : $(total_trades)")
     println("--------------------------------------------------")
-    println("  Total Return      : $(round(total_return_pct, digits=2)) %")
-    println("  Annualized Return : $(round(annualized_return * 100, digits=2)) %")
+    println("  Strategy Return   : $(round(total_return_pct, digits=2)) %")
+    println("  B&H Return        : $(round(bnh_return_pct, digits=2)) %")
+    println("  Outperformance    : $(round(outperformance, digits=2)) %")
     println("  Max Drawdown      : $(round(max_dd_pct, digits=2)) %")
     println("--------------------------------------------------")
     println("  Sharpe Ratio (Ann): $(round(sharpe_ratio, digits=3))")
@@ -275,28 +260,94 @@ function run_backtest(alpha::AbstractAlpha, aligned_df::DataFrame, target_assets
     println("  Calmar Ratio      : $(round(calmar_ratio, digits=3))")
     println("  Profit Factor     : $(profit_factor == Inf ? "Inf" : string(round(profit_factor, digits=3)))")
     println("==================================================\n")
+
+    # --------------------------------------------------------------------------
+    # STEP 4: Automated Scientific Plot Generation (Dashboard UI Style)
+    # --------------------------------------------------------------------------
+    
+    short_name = split(alpha.strategy_name, "_")[1] 
+    out_dir = joinpath(@__DIR__, "src", "alphas", "Results")
+    mkpath(out_dir)
+
+    plot_title = "$short_name Performance Summary ($(alpha.required_timeframe))"
+
+    dash_y_formatter = y -> begin
+        if y >= 1_000_000
+            return "\$" * string(round(y / 1_000_000, digits=2)) * "M"
+        elseif y >= 1_000
+            return "\$" * string(round(y / 1_000, digits=0)) * "K"
+        else
+            return "\$" * string(round(y, digits=2))
+        end
+    end
+
+    # 核心资产净值走势主图
+    p_main = plot(
+        aligned_df.timestamp, equity_curve,
+        label="Strategy Equity",
+        linewidth=2.5,
+        color=RGB(0.27, 0.38, 0.95), 
+        title=plot_title,
+        titlefont=font(14, "Helvetica"),
+        titlealign=:left,
+        xlabel="",
+        ylabel="Capital",
+        yformatter=dash_y_formatter,
+        legend=:topleft,
+        framestyle=:grid,       
+        gridalpha=0.3,          
+        foreground_color_grid=:lightgray,
+        margin=5Plots.mm
+    )
+    
+    # 🚨 注意：这里移除了 plot!(p_main, ...) 绘制 Buy & Hold 基准曲线的代码，
+    # 从而防止大周期的现货数倍涨幅压缩了策略本身的微观波动空间。
+
+    # 创建完全用于展示指标网格的空白子图
+    p_metrics = plot(
+        framestyle=:none, 
+        grid=false, 
+        showaxis=false, 
+        xticks=false, 
+        yticks=false,
+        margin=0Plots.mm
+    )
+    
+    c1, c2, c3, c4 = 0.10, 0.35, 0.60, 0.85
+    r1, r2 = 0.7, 0.2
+    
+    # 完美保留 B&H 基准数据在面板网格中
+    annotate!(p_metrics, [
+        (c1, r1, text("STRATEGY RETURN\n$(round(total_return_pct, digits=2))%", 10, :left, :black)),
+        (c2, r1, text("B&H BENCHMARK\n$(round(bnh_return_pct, digits=2))%", 10, :left, :black)),
+        (c3, r1, text("OUTPERFORMANCE\n$(round(outperformance, digits=2))%", 10, :left, :black)),
+        (c4, r1, text("MAX DRAWDOWN\n$(round(max_dd_pct, digits=2))%", 10, :left, :black)),
+        
+        (c1, r2, text("SHARPE RATIO\n$(round(sharpe_ratio, digits=2))", 10, :left, :black)),
+        (c2, r2, text("SORTINO RATIO\n$(round(sortino_ratio, digits=2))", 10, :left, :black)),
+        (c3, r2, text("PROFIT FACTOR\n$(round(profit_factor, digits=2))", 10, :left, :black)),
+        (c4, r2, text("TOTAL TRADES\n$total_trades", 10, :left, :black))
+    ])
+
+    l = @layout [a; b{0.2h}]
+    p_final = plot(p_main, p_metrics, layout=l, size=(950, 700), dpi=300, background_color=:white)
+
+    # 🚨 动态获取当前系统时间（精确到分钟）并拼接到文件名中，防止旧报告被覆盖
+    current_time_str = Dates.format(Dates.now(), "yyyymmdd_HHMM")
+    plot_file = joinpath(out_dir, "$(short_name)_$(alpha.required_timeframe)_report_$(current_time_str).pdf")
+    
+    savefig(p_final, plot_file)
+    println("[INFO] Generated institutional performance PDF at: $plot_file")
 end
 
 # ----------------------------------------------------------------------------
-# STEP 4: Strategy-Driven Data Ingestion and Alignment
+# STEP 5: Strategy-Driven Data Ingestion and Alignment
 # ----------------------------------------------------------------------------
 
-"""
-    load_and_align_datasets(assets, timeframe) -> DataFrame
-
-Load per-asset parquet files as specified by the active strategy's declared
-requirements, then inner-join them on the shared timestamp column to produce
-a single contiguous aligned dataset.
-
-Raises a fatal error if any required data file is absent, prompting the user
-to run the Python history synchronisation script.
-"""
 function load_and_align_datasets(assets::Vector{String}, timeframe::String)
     base_df = DataFrame()
 
     for (i, asset) in enumerate(assets)
-        # File names are derived entirely from strategy requirements.
-        # No hard-coded paths; the handshake protocol drives all data loading.
         data_file = "$(asset)_$(timeframe).parquet"
         file_path = joinpath(@__DIR__, "..", "data", data_file)
 
@@ -313,7 +364,6 @@ function load_and_align_datasets(assets::Vector{String}, timeframe::String)
         df = DataFrame(ds)
         sort!(df, :timestamp)
 
-        # Retain only the columns required by the backtester routing engine.
         df_clean = DataFrame(
             :timestamp                      => df.timestamp,
             Symbol("close_", asset)         => convert.(Float64, df.close),
@@ -323,7 +373,6 @@ function load_and_align_datasets(assets::Vector{String}, timeframe::String)
         if i == 1
             base_df = df_clean
         else
-            # Inner join ensures only timestamps present in all assets are retained.
             base_df = innerjoin(base_df, df_clean, on=:timestamp)
         end
     end
@@ -338,16 +387,11 @@ end
 # ----------------------------------------------------------------------------
 if abspath(PROGRAM_FILE) == @__FILE__
 
-    # Configuration: specify the alpha plugin file and its struct name.
-    # The data loading and alignment pipeline is driven entirely by the
-    # strategy's declared requirements via the handshake protocol.
-    alpha_file = "Alpha005_1_KellyCriterionMacroReflexivity.jl"
-    alpha_name = :Alpha005_1_KellyCriterionMacroReflexivity
+    alpha_file = "Alpha005_MacroReflexivity.jl"
+    alpha_name = :Alpha005_MacroReflexivity
 
-    # Step 1: Compile and instantiate the alpha plugin.
     active_strategy = load_alpha_plugin(alpha_file, alpha_name)
 
-    # Step 2: Execute the handshake — read the strategy's data requirements.
     target_assets    = active_strategy.required_tickers
     target_timeframe = active_strategy.required_timeframe
 
@@ -357,9 +401,6 @@ if abspath(PROGRAM_FILE) == @__FILE__
         "at $(target_timeframe) resolution."
     )
 
-    # Step 3: Load and align all datasets as declared by the strategy.
     aligned_data = load_and_align_datasets(target_assets, target_timeframe)
-
-    # Step 4: Execute the backtest.
     run_backtest(active_strategy, aligned_data, target_assets)
 end

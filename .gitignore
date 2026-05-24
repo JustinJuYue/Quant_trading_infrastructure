@@ -36,3 +36,6 @@ __pycache__/
 
 # VSCode
 .vscode/settings.json 
+
+# Ignore local backtest results, heatmaps, and logs
+julia_app/src/alphas/Results/

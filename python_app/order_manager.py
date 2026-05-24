@@ -9,7 +9,7 @@ from typing import Dict, Any
 import ccxt
 from dotenv import load_dotenv
 
-# Force load environment variables securely
+# 强制安全加载环境变量
 load_dotenv()
 
 logger = logging.getLogger("OrderManager")
@@ -18,6 +18,7 @@ logger = logging.getLogger("OrderManager")
 # STEP 1: Asynchronous SQLite State Machine (TradeLedger)
 # ============================================================================
 class TradeLedger:
+    """异步 SQLite 账本，确保高频读写不会阻塞主线程"""
     def __init__(self, db_path: str = "executions.db"):
         self.db_path = db_path
         self.write_queue = Queue()
@@ -37,7 +38,8 @@ class TradeLedger:
                 filled_price REAL,
                 amount REAL,
                 fee REAL,
-                order_id TEXT
+                order_id TEXT,
+                strategy_id TEXT
             )
         ''')
         conn.commit()
@@ -49,12 +51,12 @@ class TradeLedger:
             try:
                 cursor.execute('''
                     INSERT INTO executions 
-                    (id, timestamp, ticker, action, filled_price, amount, fee, order_id) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, timestamp, ticker, action, filled_price, amount, fee, order_id, strategy_id) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     trade_data['id'], trade_data['timestamp'], trade_data['ticker'],
                     trade_data['action'], trade_data['filled_price'], trade_data['amount'],
-                    trade_data['fee'], trade_data['order_id']
+                    trade_data['fee'], trade_data['order_id'], trade_data.get('strategy_id', 'UNKNOWN')
                 ))
                 conn.commit()
             except Exception as e:
@@ -62,18 +64,19 @@ class TradeLedger:
             finally:
                 self.write_queue.task_done()
 
-    def record_trade(self, ticker: str, action: str, filled_price: float, amount: float, fee: float, order_id: str):
+    def record_trade(self, ticker: str, action: str, filled_price: float, amount: float, fee: float, order_id: str, strategy_id: str):
         payload = {
             "id": str(uuid.uuid4()), "timestamp": time.time(), "ticker": ticker,
             "action": action, "filled_price": filled_price, "amount": amount,
-            "fee": fee, "order_id": order_id
+            "fee": fee, "order_id": order_id, "strategy_id": strategy_id
         }
         self.write_queue.put(payload)
 
 # ============================================================================
-# STEP 2: Risk Management Interceptor
+# STEP 2: Risk Management Interceptor (风控拦截器)
 # ============================================================================
 class RiskManager:
+    """全局物理风控：防止连环下单爆仓与胖手指巨量下单"""
     def __init__(self, cooldown_seconds: float = 10.0, max_notional_usd: float = 50000.0):
         self.cooldown_seconds = cooldown_seconds
         self.max_notional_usd = max_notional_usd
@@ -82,90 +85,86 @@ class RiskManager:
     def check_risk(self, notional: float) -> tuple[bool, str]:
         current_time = time.time()
         time_since_last_trade = current_time - self.last_trade_time
+        
         if time_since_last_trade < self.cooldown_seconds:
             return False, f"COOLDOWN_ACTIVE: Wait {self.cooldown_seconds - time_since_last_trade:.2f}s"
+            
         if notional > self.max_notional_usd:
             return False, f"FAT_FINGER_BREACH: Notional {notional:.2f} exceeds {self.max_notional_usd}"
+            
         return True, "PASS"
 
     def mark_trade_executed(self):
         self.last_trade_time = time.time()
 
 # ============================================================================
-# STEP 3: 🚀 Kelly Criterion Position Sizer Plugin 🚀
+# STEP 3: Continuous Volatility-Scaled Kelly Sizer
 # ============================================================================
 class KellyPositionSizer:
-    """
-    基于凯利公式的动态资金管理模块
-    公式: f* = p - (1-p) / b
-    (p = 胜率, b = 盈亏比 Profit/Loss Ratio)
-    """
-    def __init__(self, default_weight=0.1, kelly_fraction=0.5, max_weight=0.3):
+    def __init__(self, default_weight=0.1, kelly_fraction=0.5, max_weight=0.25):
         self.default_weight = default_weight
-        self.kelly_fraction = kelly_fraction  # 默认 0.5 即半凯利 (Half-Kelly)，降低回撤方差
-        self.max_weight = max_weight          # 硬性顶盖，单次最高不超过总仓位的 30%
-        self.alpha_stats = {}                 # 记录各策略的回测性能参数
+        self.kelly_fraction = kelly_fraction  
+        self.max_weight = max_weight          
+        self.alpha_stats = {}                 
 
     def register_alpha_stats(self, alpha_id: str, win_rate: float, win_loss_ratio: float):
-        """注入历史回测统计数据，用于启动时计算凯利阀值"""
-        self.alpha_stats[alpha_id] = {
-            'p': win_rate,
-            'b': win_loss_ratio
-        }
-        logger.info(f"Kelly Sizer registered stats for {alpha_id}: p={win_rate}, b={win_loss_ratio}")
+        self.alpha_stats[alpha_id] = {'p': win_rate, 'b': win_loss_ratio}
+        logger.info(f"Continuous Kelly registered stats for {alpha_id}: p={win_rate}, b={win_loss_ratio}")
 
     def calculate_target_weight(self, signal: Dict[str, Any]) -> float:
         alpha_id = signal.get("alpha_id", "UNKNOWN")
+        vol_scalar = float(signal.get("vol_scalar", 1.0))
         
-        # 1. 检查是否存在该 Alpha 的统计性能
         if alpha_id in self.alpha_stats:
             p = self.alpha_stats[alpha_id]['p']
             b = self.alpha_stats[alpha_id]['b']
             
-            if b <= 0: return 0.0 # 盈亏比异常保护
+            if b <= 0: return 0.0 
             
-            # 2. 计算标准凯利比例
-            q = 1.0 - p
-            full_kelly = p - (q / b)
-            
-            # 3. 凯利公式安全修正 (小于0表示该策略期望为负，不应交易)
+            full_kelly = p - ((1.0 - p) / b)
             if full_kelly <= 0:
                 logger.warning(f"📉 [Kelly Negative] {alpha_id} has negative edge. Weight truncated to 0.")
                 return 0.0
                 
-            # 4. 应用半凯利折扣与硬顶限制
-            adjusted_kelly = full_kelly * self.kelly_fraction
+            base_safe_kelly = full_kelly * self.kelly_fraction
+            adjusted_kelly = base_safe_kelly * vol_scalar
             final_weight = min(adjusted_kelly, self.max_weight)
             
-            logger.info(f"📊 [Kelly Sizer] {alpha_id} -> Full Kelly: {full_kelly*100:.1f}%, Applied Half-Kelly: {final_weight*100:.1f}%")
+            logger.info(f"📊 [Continuous Kelly] {alpha_id} -> Base: {base_safe_kelly*100:.1f}% | Vol-Scalar: {vol_scalar:.2f}x | Final Execution: {final_weight*100:.1f}%")
             return final_weight
             
         else:
-            # 如果是新策略未注册数据，退回到 Julia 原生传过来的固定 weight
             fallback_w = float(signal.get("weight", self.default_weight))
-            logger.debug(f"[Kelly Sizer] No stats for {alpha_id}, using default fallback weight: {fallback_w}")
+            logger.debug(f"[Continuous Kelly] No stats for {alpha_id}, fallback to signal weight: {fallback_w}")
             return fallback_w
 
 # ============================================================================
-# STEP 4: Order Executor (Kraken/Binance)
+# STEP 4: Order Executor (Kraken/Binance) - DRY_RUN EQUIPPED
 # ============================================================================
 class ExchangeExecution:
+    """物理订单执行器"""
     def __init__(self, exchange: ccxt.kraken):
         self.exchange = exchange
         self.ledger = TradeLedger()
-        self.risk_manager = RiskManager()
+        self.risk_manager = RiskManager(cooldown_seconds=10.0, max_notional_usd=20000.0)
         
-        # --- 注入凯利管理插件 ---
-        self.kelly_sizer = KellyPositionSizer(kelly_fraction=0.5, max_weight=0.3)
+        self.kelly_sizer = KellyPositionSizer(kelly_fraction=0.5, max_weight=0.25)
         
-        # 【重要】：在这里预先填入你 Julia 回测出来的策略胜率(p)和盈亏比(b)
-        # 例如我们假设 Alpha005 宏观策略表现为：胜率 65%，平均盈亏比 2.4
-        self.kelly_sizer.register_alpha_stats("Alpha005_Reflexivity", win_rate=0.65, win_loss_ratio=2.4)
-        # 假设 Alpha003 高频动量表现为：胜率 45%，平均盈亏比 1.5
-        self.kelly_sizer.register_alpha_stats("Alpha003_PriceKinematics", win_rate=0.45, win_loss_ratio=1.5)
+        # 【填入 Alpha 的历史表现用于计算基础凯利】
+        self.kelly_sizer.register_alpha_stats("Alpha005_MacroReflexivity", win_rate=0.48, win_loss_ratio=1.65)
         
-        logger.info("Initializing CCXT Execution Engine. Loading Markets...")
-        self.exchange.load_markets()
+        # =====================================================
+        # 🚨 全局模拟开关 (DRY_RUN BUTTON)
+        # 默认从 .env 环境变量读取，找不到则默认为 True (绝对安全)
+        # =====================================================
+        self.dry_run = os.getenv("DRY_RUN", "True").lower() in ('true', '1', 't')
+        
+        if self.dry_run:
+            logger.warning("🛡️ SYSTEM IS IN [DRY RUN] MODE. NO REAL MONEY WILL BE TRADED.")
+        else:
+            logger.critical("🔥 SYSTEM IS IN [LIVE] MODE. REAL API CALLS WILL BE EXECUTED.")
+            logger.info("Initializing CCXT Execution Engine. Loading Markets...")
+            self.exchange.load_markets() # 只有实盘才需要加载真实的交易所市场规则
 
     def execute_signal(self, signal: Dict[str, Any]):
         action = signal.get("action", "HOLD").upper()
@@ -173,18 +172,22 @@ class ExchangeExecution:
             return
             
         ticker = signal.get("ticker")
+        alpha_id = signal.get("alpha_id", "UNKNOWN")
         signal_price = float(signal.get("price_at_signal", 0.0))
         
-        # 🚨 动态仓位接管：用凯利插件计算出的仓位比例，覆盖掉默认的 weight
         weight = self.kelly_sizer.calculate_target_weight(signal)
-        
         if weight <= 0:
             logger.warning(f"Trade ignored: Kelly Position Sizer evaluated weight <= 0 for {ticker}.")
             return
 
         try:
-            base_currency, quote_currency = ticker.split('/')
-            balance = self.exchange.fetch_free_balance()
+            base_currency, quote_currency = ticker.replace("_", "/").split('/')
+            
+            # --- 1. 获取账户余额：真假分流 ---
+            if self.dry_run:
+                balance = {quote_currency: 100000.0, base_currency: 0.0} # 沙盒模拟 10 万刀
+            else:
+                balance = self.exchange.fetch_free_balance()             # 拉取真实资产
             
             amount_to_transact = 0.0
             notional_value = 0.0
@@ -195,42 +198,51 @@ class ExchangeExecution:
                 amount_to_transact = notional_value / signal_price
             elif action == "SELL":
                 base_balance = balance.get(base_currency, 0.0)
-                amount_to_transact = base_balance * weight
+                amount_to_transact = base_balance * weight if base_balance > 0 else 0
                 notional_value = amount_to_transact * signal_price
 
-            # --- RISK INTERCEPTION ---
+            if notional_value < 10.0:  
+                logger.warning(f"Trade ignored: Notional {notional_value:.2f} is below minimum order size.")
+                return
+
             risk_passed, risk_reason = self.risk_manager.check_risk(notional_value)
             if not risk_passed:
                 logger.warning(f"🛡️ RISK INTERCEPTED [{action} {ticker}]: {risk_reason}")
                 return
 
-            if notional_value < 5.0:  
-                logger.warning(f"Trade ignored: Notional {notional_value:.2f} is below minimum.")
-                return
-
-            precise_amount_str = self.exchange.amount_to_precision(ticker, amount_to_transact)
-            logger.info(f"Executing MARKET {action} for {precise_amount_str} {base_currency} on {ticker}")
-            
-            # --- MOCK RECEIPT FOR SAFETY DURING TESTING ---
-            order_receipt = {
-                'id': str(uuid.uuid4())[:8],
-                'average': signal_price, 
-                'filled': float(precise_amount_str),
-                'fee': {'cost': notional_value * 0.001} 
-            }
+            # --- 2. 下单操作：真假分流 ---
+            if self.dry_run:
+                # 模拟精度转换
+                precise_amount_str = str(round(amount_to_transact, 6)) 
+                logger.info(f"🛡️ [DRY RUN] Would execute MARKET {action} for {precise_amount_str} {base_currency} on {ticker}")
+                
+                # 模拟交易所返回的回执
+                order_receipt = {
+                    'id': f"mock-{str(uuid.uuid4())[:8]}",
+                    'average': signal_price, 
+                    'filled': float(precise_amount_str),
+                    'fee': {'cost': notional_value * 0.001} 
+                }
+            else:
+                # 真实的精度要求极严，必须用 CCXT 内置函数处理
+                precise_amount_str = self.exchange.amount_to_precision(ticker, amount_to_transact)
+                logger.critical(f"🔥 [LIVE] EXECUTING MARKET {action} for {precise_amount_str} {base_currency} on {ticker}")
+                
+                # 真实呼叫 Kraken / Binance 的 API
+                order_receipt = self.exchange.create_market_order(ticker, action.lower(), float(precise_amount_str))
 
             self.risk_manager.mark_trade_executed()
             
             filled_price = order_receipt.get('average', signal_price)
-            actual_amount = order_receipt.get('filled', amount_to_transact)
+            actual_amount = order_receipt.get('filled', float(precise_amount_str))
             fee_cost = order_receipt.get('fee', {}).get('cost', 0.0)
             order_id = order_receipt.get('id', 'UNKNOWN')
             
-            logger.info(f"✅ Order Filled! ID: {order_id} | Price: {filled_price} | Amt: {actual_amount}")
+            logger.info(f"✅ Order Filled! ID: {order_id} | Price: {filled_price} | Amt: {actual_amount} | Strategy: {alpha_id}")
             
             self.ledger.record_trade(
                 ticker=ticker, action=action, filled_price=filled_price,
-                amount=actual_amount, fee=fee_cost, order_id=order_id
+                amount=actual_amount, fee=fee_cost, order_id=order_id, strategy_id=alpha_id
             )
 
         except Exception as e:

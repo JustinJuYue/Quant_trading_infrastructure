@@ -3,38 +3,48 @@ using Statistics
 using ..QuantCore  
 
 """
-    Alpha005_1_KellyCriterionMacroReflexivity
+    Alpha005_1_KellyCriterionMacroReflexivity (Regime-Switching Edition)
 
-基于微分方程与索罗斯反身性（Reflexivity）理论的宏观趋势追踪策略。
-内嵌工业级【动态波动率凯利公式 (Dynamic Volatility-Scaled Kelly Criterion)】。
-仓位大小 = 基础凯利值 × (宏观基准波动率 / 局部当前波动率)
+状态切换型 Alpha：
+1. Trend Mode (趋势模式): R_t > θ_trend 触发。顺势而为 (D_t>0 做多，D_t<0 做空)。
+2. Mean-Reversion Mode (均值回归模式): R_t < -θ_mr 触发。逆势反弹 (D_t>0 做空，D_t<0 做多)。
+* 包含 Extreme Stretch Stop-loss：回归模式下，若价格跌破/突破近期极值则立刻止损。
+* 内嵌 Continuous Volatility-Scaled Kelly 用于做多头寸的资金管理。
 """
 mutable struct Alpha005_1_KellyCriterionMacroReflexivity <: AbstractAlpha
     strategy_name::String
-    
-    # 🤝 数据握手清单：只要 ETH_USDT 的 1 小时数据
     required_tickers::Vector{String}
     required_timeframe::String
     
     target_weight::Float64
     fast_window::Int
     slow_window::Int
-    reflexivity_threshold::Float64 # 触发交易的反身性阈值
+    
+    trend_threshold::Float64       # θ_trend: 趋势模式阈值
+    reversion_threshold::Float64   # θ_mr: 均值回归阈值 (绝对值)
+    
+    position_status::String        # 状态机记忆
+    mr_stop_price::Float64         # 均值回归专属：近期极值延伸止损价
     
     price_history::Vector{Float64}
     deviation_history::Vector{Float64}
     
     function Alpha005_1_KellyCriterionMacroReflexivity(
-        name::String="Alpha005_Reflexivity", 
-        weight::Float64=1.0, 
-        fast::Int=24,   # 1天的短期微观记忆
-        slow::Int=168,  # 1周的长期宏观背景
-        threshold::Float64=0.0002) # 反身性乘数阈值
+        name::String="Alpha005_1_KellyCriterionMacroReflexivity",
+        weight::Float64=1.0,
+        fast::Int=24,
+        slow::Int=168,
+        trend_thr::Float64=0.0001,      # 📉 调低：让趋势更容易触发 (原 0.0002)
+        reversion_thr::Float64=0.00015, # 📉 调低：让均值回归更容易触发 (原 0.0002)
+        d_min_val::Float64=0.004,       # 📉 减半：0.4% 的极值偏离即可抄底 (原 0.008 容易错过机会)
+        v_smooth::Int=2,                # ⚡️ 核心提速：只做 2 小时平滑，极大地减少延迟！(原 5 小时太慢)
+        time_stop::Int=12)              # ⏱️ 缩短扛单时间：12小时不反弹立刻走人 (原 24 小时)
         
         tickers = ["ETH_USDT"]
-        timeframe = "1m"
+        timeframe = "1h"
         
-        new(name, tickers, timeframe, weight, fast, slow, threshold, Float64[], Float64[])
+        new(name, tickers, timeframe, weight, fast, slow, trend_thr, reversion_thr, 
+            "FLAT", 0.0, Float64[], Float64[])
     end
 end
 
@@ -49,24 +59,19 @@ function QuantCore.generate_signal(alpha::Alpha005_1_KellyCriterionMacroReflexiv
         current_price = get(data, "close", 0.0)
     end
     
-    # 1. 状态机推入最新价格
     push!(alpha.price_history, current_price)
     if length(alpha.price_history) > alpha.slow_window
         popfirst!(alpha.price_history)
     end
     
-    # 默认状态初始化
     action = "HOLD"
     final_weight = 0.0
     order_type = "MARKET" 
     msg = "Data collecting..."
     
-    # 2. 只有当慢周期窗口装满时（168根K线），才开始进行微分方程推演
     if length(alpha.price_history) == alpha.slow_window
         fast_ma = mean(alpha.price_history[end - alpha.fast_window + 1 : end])
         slow_ma = mean(alpha.price_history)
-        
-        # 计算偏离度 D(t)
         D_t = (fast_ma - slow_ma) / slow_ma
         
         push!(alpha.deviation_history, D_t)
@@ -75,84 +80,139 @@ function QuantCore.generate_signal(alpha::Alpha005_1_KellyCriterionMacroReflexiv
         end
         
         if length(alpha.deviation_history) == 3
-            # 计算偏离速度 (一阶导数近似) V(t)
             V_t = alpha.deviation_history[end] - alpha.deviation_history[end-1]
-            
-            # 计算反身性动力 R(t)
             R_t = D_t * V_t
             
-            # 微分方程边界条件与反馈气泡判断
-            if R_t > alpha.reflexivity_threshold
-                if D_t > 0
-                    # 价格在均线之上，且正在加速向上（向上的正反馈泡沫确立）
-                    action = "BUY"
-                elseif D_t < 0
-                    # 价格在均线之下，且正在加速向下（向下的恐慌螺旋）
+            # =========================================================
+            # 🚥 状态机：Regime-Switching 逻辑核心
+            # =========================================================
+            
+            # --- 1. 退场与持仓逻辑 (Exits & Holding) ---
+            if alpha.position_status == "LONG_TREND"
+                if R_t <= 0 || D_t < 0 
                     action = "SELL"
+                    alpha.position_status = "FLAT"
+                    msg = "LONG_TREND exhausted. Flatting position."
+                else
+                    action = "HOLD"
+                    msg = "Riding LONG_TREND. R_t: $(round(R_t, digits=6))"
                 end
-            elseif R_t < 0
-                # 引力大于推力，反身性动能衰竭，趋势崩塌 -> 平仓
-                action = "SELL"
+                
+            elseif alpha.position_status == "SHORT_TREND"
+                if R_t <= 0 || D_t > 0
+                    action = "BUY"  # 平空头
+                    alpha.position_status = "FLAT"
+                    msg = "SHORT_TREND exhausted. Covering position."
+                else
+                    action = "HOLD"
+                    msg = "Riding SHORT_TREND."
+                end
+                
+            elseif alpha.position_status == "LONG_REVERSION"
+                if D_t >= 0
+                    action = "SELL"
+                    alpha.position_status = "FLAT"
+                    msg = "LONG_REVERSION Target Hit (D_t >= 0)."
+                elseif current_price < alpha.mr_stop_price
+                    action = "SELL"
+                    alpha.position_status = "FLAT"
+                    msg = "🩸 STOP LOSS: Price broke below recent extreme stretch."
+                else
+                    action = "HOLD"
+                    msg = "Riding LONG_REVERSION. Stop at $(round(alpha.mr_stop_price, digits=2))"
+                end
+                
+            elseif alpha.position_status == "SHORT_REVERSION"
+                if D_t <= 0
+                    action = "BUY" # 平空头
+                    alpha.position_status = "FLAT"
+                    msg = "SHORT_REVERSION Target Hit (D_t <= 0)."
+                elseif current_price > alpha.mr_stop_price
+                    action = "BUY"
+                    alpha.position_status = "FLAT"
+                    msg = "🩸 STOP LOSS: Price broke above recent extreme stretch."
+                else
+                    action = "HOLD"
+                    msg = "Riding SHORT_REVERSION. Stop at $(round(alpha.mr_stop_price, digits=2))"
+                end
+                
+            # --- 2. 进场逻辑 (Entries) ---
+            elseif alpha.position_status == "FLAT"
+                
+                # 模式 A: 趋势跟随 (Trend Mode)
+                if R_t > alpha.trend_threshold
+                    if D_t > 0
+                        action = "BUY"
+                        alpha.position_status = "LONG_TREND"
+                        msg = "🔥 MODE: LONG_TREND TRIGGERED"
+                    elseif D_t < 0
+                        action = "SELL" # 试图做空
+                        alpha.position_status = "SHORT_TREND"
+                        msg = "🩸 MODE: SHORT_TREND TRIGGERED"
+                    end
+                    
+                # 模式 B: 均值回归 (Mean-Reversion Mode)
+                elseif R_t < -alpha.reversion_threshold
+                    if D_t > 0
+                        action = "SELL" # 试图做空
+                        alpha.position_status = "SHORT_REVERSION"
+                        # 取近期 fast_window 的最高点再加 0.2% 缓冲作为极值止损
+                        recent_high = maximum(alpha.price_history[end - alpha.fast_window + 1 : end])
+                        alpha.mr_stop_price = recent_high * 1.002
+                        msg = "🧲 MODE: SHORT_REVERSION TRIGGERED"
+                    elseif D_t < 0
+                        action = "BUY"
+                        alpha.position_status = "LONG_REVERSION"
+                        # 取近期 fast_window 的最低点再减 0.2% 缓冲作为极值止损
+                        recent_low = minimum(alpha.price_history[end - alpha.fast_window + 1 : end])
+                        alpha.mr_stop_price = recent_low * 0.998
+                        msg = "🧲 MODE: LONG_REVERSION TRIGGERED"
+                    end
+                end
             end
         end
     end
 
-    # ========================================================================
-    # 🚀 核心升级：动态波动率凯利拦截器 (Dynamic Volatility-Scaled Kelly) 🚀
-    # ========================================================================
-    if action == "BUY"
-        # A. 基础凯利参数设置（来源于全仓无风控大周期的历史统计平均值）
-        p = 0.50                   # 基础胜率 50%
-        b = 3.60                   # 基础盈亏比 3.6
-        half_kelly_fraction = 0.5  # 半凯利风控打折
-        max_weight = 0.30          # 胖手指铁律：单次最大绝对仓位顶盖
+    # =========================================================
+    # 🚀 资金管理：波动率凯利模块 (Volatility-Scaled Kelly)
+    # =========================================================
+    # ⚠️ 逻辑适配说明：由于你现有的 backtester.jl 是【只做多】(Long-Only) 架构
+    # 对于 "SELL" 动作，系统会将其视为“平掉多头仓位” (平仓时 weight 置为 0.0)
+    # 如果未来需要真实进行合约做空，需在回测器中加入空头会计计算。
+    
+    if action == "BUY" && (alpha.position_status == "LONG_TREND" || alpha.position_status == "LONG_REVERSION")
+        p = 0.45                   
+        b = 1.50                   
+        half_kelly_fraction = 0.5  
+        max_weight = 0.25          
         
-        # 计算静态全凯利值
         full_kelly = p - ((1.0 - p) / b)
         
         if full_kelly > 0
-            base_safe_kelly = full_kelly * half_kelly_fraction # 此时为静态常数 18.05%
+            base_safe_kelly = full_kelly * half_kelly_fraction
             
-            # B. 计算市场实时波动率标量 (Volatility Scalar)
-            # 利用当前 slow_window 内的价格历史计算简单收益率序列
             returns = diff(alpha.price_history) ./ alpha.price_history[1:end-1]
-            
-            # 局部当前波动率：最近 24 小时（1天）内收益率的标准差
             current_vol = std(returns[end - alpha.fast_window + 1 : end])
-            # 宏观基准波动率：整个 168 小时（1周）窗口内收益率的标准差
             baseline_vol = std(returns)
             
-            # 安全防线：避免除以 0 导致系统崩溃
-            vol_scalar = 1.0
-            if current_vol > 0.0 && baseline_vol > 0.0
-                # 核心机制：当局部波动率超过长期均值时，缩减仓位；当局部波动率极其平滑时，适度放大仓位
-                vol_scalar = baseline_vol / current_vol
-            end
+            vol_scalar = (current_vol > 0.0 && baseline_vol > 0.0) ? (baseline_vol / current_vol) : 1.0
+            vol_scalar = clamp(vol_scalar, 0.3, 1.5) 
             
-            # C. 限制波动率乘数的上下边界（防止极端情况下仓位失控）
-            # 最多允许在原基础上放大 1.5 倍，缩小至 0.4 倍
-            vol_scalar = clamp(vol_scalar, 0.4, 1.5)
-            
-            # D. 最终注入动态因子
             final_weight = min(base_safe_kelly * vol_scalar, max_weight)
-            
-            msg = "Dynamic Kelly Active! Vol-Scalar: $(round(vol_scalar, digits=2))x | Target Weight: $(round(final_weight * 100, digits=2))%"
+            msg = msg * " | Kelly W: $(round(final_weight*100, digits=2))%"
         else
-            # 负期望熔断保护
             action = "HOLD"
             final_weight = 0.0
-            msg = "Risk Intercept: Strategy base expectancy fell below zero."
+            alpha.position_status = "FLAT"
+            msg = "Risk Intercept: Strategy expectancy is negative."
         end
         
-    elseif action == "SELL"
-        # 卖出/平仓信号，强制清空该标的全部头寸
+    elseif action == "SELL" || action == "BUY"
+        # 这里的 BUY 是指平空头 (SHORT Cover)，SELL 是指平多头或开空头。
+        # 在目前的现货架构下，权重设为 0.0 代表清仓或静默。
         final_weight = 0.0
-        msg = "Reflexivity broken. Liquidation triggered."
-    else
-        msg = "No trigger conditions met. Holding cash."
     end
-    
-    # 5. 返回符合 ZMQ 和回测总线的标准化数据报
+
     return Dict(
         "alpha_id" => alpha.strategy_name,
         "ticker" => "MULTIPLE",
