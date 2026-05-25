@@ -10,8 +10,7 @@ __pycache__/
 # Logs
 *.log
 .env
-.cloud_server_key.txt
-
+cloud_server_key.txt
 data/preview.py
 
 # 🗄️  Data files — stored locally, not in Git
