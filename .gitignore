@@ -10,6 +10,7 @@ __pycache__/
 # Logs
 *.log
 .env
+.cloud_server_key.txt
 
 data/preview.py
 
