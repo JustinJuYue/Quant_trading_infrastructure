@@ -121,8 +121,15 @@ fi
 log "Instantiating and precompiling Julia environment..."
 (
     cd "$ROOT_DIR/julia_app"
+
+    # Remove old Manifest.toml to avoid Julia version conflicts
+    if [ -f "Manifest.toml" ]; then
+        rm -f Manifest.toml
+        log "Removed old Manifest.toml — will regenerate for current Julia version"
+    fi
+
     julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
-    
+
     # Fix 4: Dynamically parse Project.toml to only verify actual dependencies
     if [ -f "Project.toml" ]; then
         # Extract package names from [deps] section (e.g., "ZMQ = ...")
