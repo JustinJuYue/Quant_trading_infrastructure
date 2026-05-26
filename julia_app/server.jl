@@ -15,7 +15,7 @@ using .QuantCore
 
 const ZMQ_ENDPOINT = "tcp://127.0.0.1:5555"
 const ALPHAS_DIR = joinpath(@__DIR__, "src", "alphas")
-
+ 
 """
     load_alpha_plugin
 """
