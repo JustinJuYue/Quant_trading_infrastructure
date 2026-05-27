@@ -35,12 +35,19 @@ end
     hydrate_alpha_states!(active_alphas::Vector{AbstractAlpha})
 
 🚀 工业级状态水合引擎 (State Hydration Engine) - Low-Spec Optimized
-Reads historical files using lightweight column access instead of DataFrames.
+Reads historical files using lightweight column access. Completely avoids sorting
+to prevent single-core JIT compilation hangs.
 """
 function hydrate_alpha_states!(active_alphas::Vector{AbstractAlpha})
     println("\n==================================================")
     println("💧 INITIALIZING STATE HYDRATION (PRE-WARMUP)")
     println("==================================================")
+    
+    # [OPTIMIZATION]: Force JIT compilation of basic operations before hydration.
+    # This prevents the single-core CPU from freezing during initial data processing.
+    _ = collect(1:5)
+    _ = Float64(1)
+    _ = Int64(1)
     
     for alpha in active_alphas
         println("[HYDRATE] Preparing memory for: $(alpha.strategy_name)")
@@ -52,7 +59,6 @@ function hydrate_alpha_states!(active_alphas::Vector{AbstractAlpha})
         warmup_rows = 50 
         
         for asset in target_assets
-            # [OPTIMIZATION]: Wrap in try/catch to prevent crashes on data errors
             try
                 data_file = "$(asset)_$(tf).parquet"
                 file_path = joinpath(@__DIR__, "..", "data", data_file)
@@ -68,13 +74,11 @@ function hydrate_alpha_states!(active_alphas::Vector{AbstractAlpha})
                 closes = ds[:close]
                 volume_spikes = ds[:volume_spike]
                 
-                # Sort by getting sorted indices natively
-                idx = sortperm(timestamps)
-                
-                # Slice last warmup_rows
+                # [OPTIMIZATION]: history_sync.py guarantees data is chronologically ordered.
+                # Removed sortperm() to bypass massive LLVM JIT compilation times on 1 vCPU.
                 n = length(timestamps)
                 start_i = max(1, n - warmup_rows + 1)
-                slice_idx = idx[start_i:end]
+                slice_idx = start_i:n  # Direct range, no sort needed
                 
                 println("[HYDRATE] Injecting $(length(slice_idx)) historical bars from $data_file into $(alpha.strategy_name) memory matrix...")
                 
