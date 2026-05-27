@@ -23,6 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG_DIR="$ROOT_DIR/logs"
 ENV_FILE="$ROOT_DIR/.env"
+USER_NAME=$(whoami)
 
 # Ensure we have root/sudo privileges before we start
 if ! sudo -v >/dev/null 2>&1; then
@@ -36,7 +37,7 @@ log "1. Initializing system directories..."
 mkdir -p "$LOG_DIR"
 
 # ============================================================================
-# Step 1.5: System Dependencies (Fix 3)
+# Step 1.5: System Dependencies
 # ============================================================================
 log "1.5 Installing system dependencies..."
 sudo apt-get update -qq
@@ -95,7 +96,6 @@ JULIA_VERSION="1.10.9"
 INSTALL_JULIA=true
 
 if command -v julia >/dev/null 2>&1; then
-    # Fix 1: Strip whitespaces/newlines from version output
     INSTALLED_JULIA=$(julia -e 'print(VERSION)' | tr -d '[:space:]')
     if [ "$INSTALLED_JULIA" == "$JULIA_VERSION" ]; then
         log "Julia $JULIA_VERSION is already installed."
@@ -121,18 +121,9 @@ fi
 log "Instantiating and precompiling Julia environment..."
 (
     cd "$ROOT_DIR/julia_app"
-
-    # Remove old Manifest.toml to avoid Julia version conflicts
-    if [ -f "Manifest.toml" ]; then
-        rm -f Manifest.toml
-        log "Removed old Manifest.toml — will regenerate for current Julia version"
-    fi
-
     julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
-
-    # Fix 4: Dynamically parse Project.toml to only verify actual dependencies
+    
     if [ -f "Project.toml" ]; then
-        # Extract package names from [deps] section (e.g., "ZMQ = ...")
         DEPS=$(grep -E '^[A-Za-z0-9_]+ =' Project.toml | cut -d' ' -f1 | paste -sd "," -)
         if [ -n "$DEPS" ]; then
             log "Verifying actual Julia packages: $DEPS"
@@ -164,11 +155,63 @@ log "4. Checking Python environment..."
 )
 
 # ============================================================================
-# Step 5: systemd Service Registration
+# Step 4.5: Registering history-sync service and timer
 # ============================================================================
-log "5. Configuring systemd services..."
+log "4.5 Registering history-sync service and timer..."
 
-USER_NAME=$(whoami)
+HISTORY_SVC="/etc/systemd/system/history-sync.service"
+HISTORY_TIMER="/etc/systemd/system/history-sync.timer"
+
+# Create service file
+sudo bash -c "cat <<EOF > $HISTORY_SVC
+[Unit]
+Description=Quant History Data Sync (pre-flight)
+After=network.target
+
+[Service]
+Type=oneshot
+User=$USER_NAME
+WorkingDirectory=$ROOT_DIR/python_app
+EnvironmentFile=$ENV_FILE
+ExecStart=$ROOT_DIR/python_app/.venv/bin/python history_sync.py
+StandardOutput=append:$LOG_DIR/history_sync.log
+StandardError=append:$LOG_DIR/history_sync.err
+TimeoutStartSec=1800
+EOF"
+
+# Create timer file  
+sudo bash -c "cat <<EOF > $HISTORY_TIMER
+[Unit]
+Description=Daily History Data Sync
+
+[Timer]
+OnCalendar=*-*-* 00:05:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF"
+
+# Enable timer
+sudo systemctl daemon-reload
+sudo systemctl enable history-sync.timer
+sudo systemctl start history-sync.timer
+
+# ============================================================================
+# Step 4.6: Running initial history sync
+# ============================================================================
+log "4.6 Running initial history sync (incremental update)..."
+# Adding || true to prevent set -e from aborting the script if the sync fails
+sudo systemctl start history-sync.service || true
+# Wait for sync to complete (max 30 minutes)
+sudo systemctl is-active --wait history-sync.service || \
+    warn "History sync did not complete cleanly"
+
+# ============================================================================
+# Step 5: systemd Service Registration (Julia & Python)
+# ============================================================================
+log "5. Configuring core trading systemd services..."
+
 JULIA_SVC="/etc/systemd/system/quant-julia.service"
 PYTHON_SVC="/etc/systemd/system/quant-python.service"
 
@@ -176,7 +219,8 @@ PYTHON_SVC="/etc/systemd/system/quant-python.service"
 sudo bash -c "cat <<EOF > $JULIA_SVC
 [Unit]
 Description=Quant Trading Julia ZMQ Server (Strategy Engine)
-After=network.target
+After=network.target history-sync.service
+Requires=history-sync.service
 
 [Service]
 Type=simple
@@ -199,7 +243,6 @@ sudo bash -c "cat <<EOF > $PYTHON_SVC
 [Unit]
 Description=Quant Trading Python Live Feed (Execution Gateway)
 After=network.target quant-julia.service
-# Fix 2: Changed from Requires to Wants so Python doesn't crash if Julia restarts
 Wants=quant-julia.service
 
 [Service]
@@ -235,6 +278,7 @@ sleep 8
 
 JULIA_STATUS=$(systemctl is-active quant-julia.service || echo "failed")
 PYTHON_STATUS=$(systemctl is-active quant-python.service || echo "failed")
+TIMER_STATUS=$(systemctl is-active history-sync.timer || echo "failed")
 
 echo ""
 echo "=================================================="
@@ -242,6 +286,7 @@ echo "           DEPLOYMENT SUMMARY"
 echo "=================================================="
 echo "  Julia  service: [$JULIA_STATUS]"
 echo "  Python service: [$PYTHON_STATUS]"
+echo "  Sync timer    : [$TIMER_STATUS]"
 echo "  DRY_RUN:        $DRY_RUN_VAL"
 echo "  ZMQ Port:       $(get_env "ZMQ_PORT")"
 echo "  Log directory:  $LOG_DIR/"

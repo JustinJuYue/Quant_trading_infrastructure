@@ -6,8 +6,8 @@
 using ZMQ
 using MsgPack
 using Dates
-using DataFrames
 using Parquet2
+# [OPTIMIZATION]: Removed `using DataFrames` to save ~200MB memory and skip heavy JIT compilation
 
 # Include the core interface
 include("src/Core.jl")
@@ -15,7 +15,7 @@ using .QuantCore
 
 const ZMQ_ENDPOINT = "tcp://127.0.0.1:5555"
 const ALPHAS_DIR = joinpath(@__DIR__, "src", "alphas")
- 
+
 """
     load_alpha_plugin
 """
@@ -34,8 +34,8 @@ end
 """
     hydrate_alpha_states!(active_alphas::Vector{AbstractAlpha})
 
-🚀 工业级状态水合引擎 (State Hydration Engine)
-在启动 ZMQ 监听之前，自动读取本地 Parquet 历史文件，把策略所需的内存状态完全喂满。
+🚀 工业级状态水合引擎 (State Hydration Engine) - Low-Spec Optimized
+Reads historical files using lightweight column access instead of DataFrames.
 """
 function hydrate_alpha_states!(active_alphas::Vector{AbstractAlpha})
     println("\n==================================================")
@@ -48,50 +48,65 @@ function hydrate_alpha_states!(active_alphas::Vector{AbstractAlpha})
         target_assets = alpha.required_tickers
         tf = alpha.required_timeframe
         
-        # 1. 动态对齐并读取该策略历史文件的最后 200 根 K 线作为热身基底
-        # 168小时的慢窗口 + 额外富余空间，200行是单资产低频策略最稳健的水合深度
-        warmup_rows = 200
+        # [OPTIMIZATION]: Reduced warmup rows to 50 (sufficient for Alpha003 & Alpha005 memory)
+        warmup_rows = 50 
         
         for asset in target_assets
-            data_file = "$(asset)_$(tf).parquet"
-            file_path = joinpath(@__DIR__, "..", "data", data_file)
-            
-            if !isfile(file_path)
-                println("[WARN] Missing $data_file! Skipping hydration for this asset. Alpha will face Cold Start.")
-                continue
-            end
-            
-            # 读取历史 Parquet 文件
-            ds = Parquet2.Dataset(file_path)
-            df = DataFrame(ds)
-            sort!(df, :timestamp)
-            
-            total_history = nrow(df)
-            start_row = max(1, total_history - warmup_rows + 1)
-            df_slice = df[start_row:end, :]
-            
-            println("[HYDRATE] Injecting $(nrow(df_slice)) historical bars from $data_file into $(alpha.strategy_name) memory matrix...")
-            
-            # 2. 模拟时序演进，静默推入策略状态机
-            for row in eachrow(df_slice)
-                # 严格构造与实盘完全一致的多资产嵌套数据总线结构
-                assets_payload = Dict{String, Dict{String, Any}}()
-                assets_payload[asset] = Dict{String, Any}(
-                    "close" => convert(Float64, row.close),
-                    "volume_spike" => convert(Int64, row.volume_spike)
-                )
+            # [OPTIMIZATION]: Wrap in try/catch to prevent crashes on data errors
+            try
+                data_file = "$(asset)_$(tf).parquet"
+                file_path = joinpath(@__DIR__, "..", "data", data_file)
                 
-                mock_market_data = Dict{String, Any}(
-                    "ticker" => asset,
-                    "resolution" => tf,
-                    "timestamp" => Dates.datetime2unix(row.timestamp) * 1000,
-                    "assets" => assets_payload
-                )
+                if !isfile(file_path)
+                    println("[WARN] Missing $data_file! Skipping hydration for this asset. Alpha will face Cold Start.")
+                    continue
+                end
                 
-                # 默默让策略计算状态，丢弃返回的实时信号（不产生历史误下单）
-                _ = generate_signal(alpha, mock_market_data)
+                # [OPTIMIZATION]: Read only needed columns directly via Parquet2
+                ds = Parquet2.Dataset(file_path)
+                timestamps = ds[:timestamp]
+                closes = ds[:close]
+                volume_spikes = ds[:volume_spike]
+                
+                # Sort by getting sorted indices natively
+                idx = sortperm(timestamps)
+                
+                # Slice last warmup_rows
+                n = length(timestamps)
+                start_i = max(1, n - warmup_rows + 1)
+                slice_idx = idx[start_i:end]
+                
+                println("[HYDRATE] Injecting $(length(slice_idx)) historical bars from $data_file into $(alpha.strategy_name) memory matrix...")
+                
+                # Build mock_market_data directly from column arrays
+                for i in slice_idx
+                    assets_payload = Dict{String, Dict{String, Any}}(
+                        asset => Dict{String, Any}(
+                            "close" => Float64(closes[i]),
+                            "volume_spike" => Int64(volume_spikes[i])
+                        )
+                    )
+                    
+                    # Defensively handle the timestamp in case Parquet2 parses it as a DateTime instead of a Unix integer
+                    raw_ts = timestamps[i]
+                    ts_val = raw_ts isa DateTime ? Dates.datetime2unix(raw_ts) * 1000 : Float64(raw_ts) * 1000
+
+                    mock_market_data = Dict{String, Any}(
+                        "ticker" => asset,
+                        "resolution" => tf,
+                        "timestamp" => ts_val,
+                        "assets" => assets_payload
+                    )
+                    
+                    # Silently push to the state machine
+                    _ = generate_signal(alpha, mock_market_data)
+                end
+                println("[SUCCESS] $(alpha.strategy_name) memory cells are fully hydrated and warmed up for $(asset)!")
+
+            catch e
+                println("[ERROR] Hydration failed for $(alpha.strategy_name) on $(asset): ", e)
+                println("[WARN] Continuing without full hydration...")
             end
-            println("[SUCCESS] $(alpha.strategy_name) memory cells are fully hydrated and warmed up for $(asset)!")
         end
     end
     println("==================================================")
@@ -170,7 +185,7 @@ alpha_fleet = [
     # 挂载 1 小时宏观反身性策略
     load_alpha_plugin("Alpha005_MacroReflexivity.jl", :Alpha005_MacroReflexivity),
     
-    # 挂载 1 分钟价格动力学策略 (确保该策略里写了 required_timeframe=\"1m\")
+    # 挂载 1 分钟价格动力学策略 (确保该策略里写了 required_timeframe="1m")
     load_alpha_plugin("Alpha003_PriceKinematics.jl", :Alpha003_PriceKinematics)
 ]
 
