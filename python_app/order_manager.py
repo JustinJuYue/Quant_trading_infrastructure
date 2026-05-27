@@ -195,8 +195,8 @@ class ExchangeExecution:
     """物理订单执行器"""
     
     ALPHA_CAPITAL_CONFIG = {
-        "Alpha005_MacroReflexivity": 500.0,   # Initial allocation in USD
-        "Alpha003_PriceKinematics":  500.0,   # Initial allocation in USD
+        "Alpha005_MacroReflexivity": 50.0,   # Initial allocation in USD
+        "Alpha003_PriceKinematics":  0.0,   # Initial allocation in USD
     }
 
     def __init__(self, exchange: ccxt.kraken):
